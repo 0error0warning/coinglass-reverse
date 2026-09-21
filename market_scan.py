@@ -333,36 +333,78 @@ CG_SYMBOL_FMT = {
     'Gate': '{c}_USDT',
 }
 
+def cg_fetch(path, params):
+    """CoinGlass API 通用请求"""
+    if not CG_AVAILABLE: return None
+    params = dict(params)
+    params['data'] = _cg_data_param()
+    try:
+        d = fetch_and_decrypt(f'https://capi.coinglass.com{path}', params)
+        return d if isinstance(d,(dict,list)) else None
+    except Exception:
+        return None
+
 def coinglass_heatmap(symbol='BTC', exchange='Binance', interval='5', limit=288):
     """CoinGlass 内部清算热图 API — 解密后返回结构化数据
     支持多币种/多交易所/多时间窗
     interval: 5,15,30,h2,h6,h12,h24,d1 (不同币种支持的 interval 不同)
     """
-    if not CG_AVAILABLE: return None
-    try:
-        fmt = CG_SYMBOL_FMT.get(exchange, '{c}USDT')
-        sym = f'{exchange}_{fmt.format(c=symbol)}'
-        # v3 端点支持多币种
-        params = {'merge':'true','symbol':sym,'interval':str(interval),'limit':str(limit),'data':_cg_data_param()}
-        d = fetch_and_decrypt(f'https://capi.coinglass.com/api/index/v3/liqHeatMap', params)
-        if not isinstance(d,dict) or 'liq' not in d: return None
-        # 解析
-        y_axis = d['y']  # 价格轴
-        liq = d['liq']   # [[x_idx,y_idx,amount],...]
-        prices = d.get('prices',[])
-        spot = float(prices[-1][4]) if prices else 0
-        # 按价格聚合清算强度
-        by_price = defaultdict(float)
-        for x_idx,y_idx,amt in liq:
-            if y_idx < len(y_axis):
-                by_price[y_axis[y_idx]] += float(amt)
-        return {
-            'spot':spot, 'y_axis':y_axis, 'by_price':dict(by_price),
-            'range':(d.get('rangeLow'),d.get('rangeHigh')),
-            'updateTime':d.get('updateTime'), 'instrument':d.get('instrument',{}).get('instrumentId'),
-        }
-    except Exception as e:
-        return {'err':str(e)}
+    fmt = CG_SYMBOL_FMT.get(exchange, '{c}USDT')
+    sym = f'{exchange}_{fmt.format(c=symbol)}'
+    d = cg_fetch('/api/index/v3/liqHeatMap',
+        {'merge':'true','symbol':sym,'interval':str(interval),'limit':str(limit)})
+    if not isinstance(d,dict) or 'liq' not in d: return None
+    y_axis = d['y']
+    liq = d['liq']
+    prices = d.get('prices',[])
+    spot = float(prices[-1][4]) if prices else 0
+    by_price = defaultdict(float)
+    for x_idx,y_idx,amt in liq:
+        if y_idx < len(y_axis):
+            by_price[y_axis[y_idx]] += float(amt)
+    return {
+        'spot':spot, 'y_axis':y_axis, 'by_price':dict(by_price),
+        'range':(d.get('rangeLow'),d.get('rangeHigh')),
+        'updateTime':d.get('updateTime'), 'instrument':d.get('instrument',{}).get('instrumentId'),
+    }
+
+def cg_home_stats():
+    """CoinGlass 全市场统计"""
+    return cg_fetch('/api/futures/home/statistics', {})
+
+def cg_oi_change_rank(limit=10):
+    """OI 变化排行 (全币种)"""
+    return cg_fetch('/api/home/oi/changeRank',
+        {'sort':'h4OiChangePercent','order':'desc','pageNum':'1','pageSize':str(limit),'ex':'all'})
+
+def cg_coin_markets(limit=20):
+    """全币种市场数据 (多空比/费率/爆仓/OI)"""
+    return cg_fetch('/api/home/v2/coinMarkets',
+        {'sort':'h4PriceChangePercent','order':'desc','pageNum':'1','pageSize':str(limit),'ex':'all'})
+
+def cg_funding_chart(symbol='BTC'):
+    """全所费率对比"""
+    return cg_fetch('/api/fundingRate/chart', {'symbol':symbol})
+
+def cg_liquidation_chart(symbol='BTC'):
+    """180天爆仓历史 (按交易所)"""
+    return cg_fetch('/api/futures/liquidation/chart', {'symbol':symbol})
+
+def cg_liquidation_info():
+    """各所爆仓统计"""
+    return cg_fetch('/api/futures/liquidation/info', {})
+
+def cg_etf_flow():
+    """ETF 资金流历史"""
+    return cg_fetch('/api/etf/flow', {})
+
+def cg_ahr999():
+    """AHR999 指数 (5711天历史)"""
+    return cg_fetch('/api/index/ahr999', {})
+
+def cg_fear_greed():
+    """恐惧贪婪指数"""
+    return cg_fetch('/api/index/fearGreed', {})
 
 def print_cg_heatmap(h, symbol):
     if not h or 'err' in h:
