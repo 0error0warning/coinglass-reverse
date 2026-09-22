@@ -96,6 +96,30 @@ def _token(value, name):
     return value
 
 
+
+def _resolve_pair_ticker(matches, symbol, quote):
+    """Pick one pair instrument from ticker search hits.
+
+    Live CoinGlass ticker search returns perpetual + dated deliveries for the
+    same exchange/base/quote (e.g. BTCUSDT plus BTCUSDT_260925). Prefer the
+    conventional `{symbol}{quote}` originalSymbol (BTCUSDT) — the same ticker
+    the 6/6 live pair smoke used — then a unique type==1 perpetual. Zero hits
+    or remaining ambiguity stay fail-closed.
+    """
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise CoinGlassError('instrument', 'ambiguous_or_unknown', 'Expected one matching instrument')
+    conventional = f'{symbol}{quote}'
+    exact = [r for r in matches if r.get('originalSymbol') == conventional]
+    if len(exact) == 1:
+        return exact[0]
+    perps = [r for r in matches if r.get('type') == 1]
+    if len(perps) == 1:
+        return perps[0]
+    raise CoinGlassError('instrument', 'ambiguous_or_unknown', 'Expected one matching instrument')
+
+
 def coinglass_heatmap(symbol='BTC', exchange='Binance', interval=None, limit=None,
                       *, model=1, scope='pair', window=None, quote='USDT', original_symbol=None):
     if isinstance(model, bool) or (model, scope) not in ROUTES:
@@ -130,9 +154,7 @@ def coinglass_heatmap(symbol='BTC', exchange='Binance', interval=None, limit=Non
                 raise CoinGlassError('schema', 'invalid_tickers', 'Ticker response must be an array')
             matches = [r for r in rows if isinstance(r, dict) and r.get('exchangeName') == exchange
                        and r.get('symbol') == symbol and r.get('quoteCurrency') == quote]
-            if len(matches) != 1:
-                raise CoinGlassError('instrument', 'ambiguous_or_unknown', 'Expected one matching instrument')
-            ticker = matches[0]
+            ticker = _resolve_pair_ticker(matches, symbol, quote)
             original_symbol = _token(ticker.get('originalSymbol'), 'original_symbol')
         request_symbol = f'{exchange}_{original_symbol}'
     else:

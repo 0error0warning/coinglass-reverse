@@ -33,7 +33,7 @@ except CoinGlassError as exc:
     print("Data unavailable:", exc.category, exc.code)
 ```
 
-Omit `original_symbol` to resolve the exchange/quote instrument from CoinGlass's public ticker metadata. Ambiguous or missing matches fail explicitly; no fallback manufactures `COINUSDT`. Models 1/2/3 and pair/aggregate scopes use separate endpoints. Legacy v3 is an explicit compatibility mode, not a numbered current model.
+Omit `original_symbol` to resolve the exchange/quote instrument from CoinGlass's public ticker metadata. When several instruments share the same exchange/base/quote (perpetual plus dated deliveries), the client prefers the conventional `{symbol}{quote}` ticker (e.g. `BTCUSDT`, matching live pair smoke) or a unique `type==1` perpetual. Truly unknown or still-ambiguous matches fail closed; no fallback manufactures a fake `COINUSDT`. Models 1/2/3 and pair/aggregate scopes use separate endpoints. Legacy v3 is an explicit compatibility mode, not a numbered current model.
 
 - `by_price` and `top_above/top_below` use **only the final time slice**, not sums of historical snapshots.
 - `raw` preserves the original axes, candles, cells and instrument metadata.

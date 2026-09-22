@@ -103,6 +103,34 @@ class ClientTests(unittest.TestCase):
             with patch.object(cg, 'cg_fetch', return_value=rows):
                 with self.assertRaises(dec.CoinGlassError): cg.coinglass_heatmap(exchange='KuCoin')
 
+    def test_default_pair_prefers_conventional_perpetual_ticker(self):
+        """Binance BTC/USDT search returns perp + deliveries; prefer BTCUSDT like live 6/6 smoke."""
+        rows = [
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+             'originalSymbol': 'BTCUSDT_261225', 'type': 5},
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+             'originalSymbol': 'BTCUSDT', 'type': 1},
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+             'originalSymbol': 'BTCUSDT_260925', 'type': 4},
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDC',
+             'originalSymbol': 'BTCUSDC', 'type': 1},
+        ]
+        with patch.object(cg, 'cg_fetch', side_effect=[rows, fixture()]) as fetch:
+            result = cg.coinglass_heatmap()
+        self.assertEqual(fetch.call_args.args[1]['symbol'], 'Binance_BTCUSDT')
+        self.assertEqual(result['metadata']['ticker']['originalSymbol'], 'BTCUSDT')
+        # No conventional symbol and multiple type==1 -> still fail closed.
+        amb = [
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+             'originalSymbol': 'BTCUSDT_A', 'type': 1},
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+             'originalSymbol': 'BTCUSDT_B', 'type': 1},
+        ]
+        with patch.object(cg, 'cg_fetch', return_value=amb):
+            with self.assertRaises(dec.CoinGlassError) as caught:
+                cg.coinglass_heatmap()
+            self.assertEqual(caught.exception.code, 'ambiguous_or_unknown')
+
     def test_positional_and_explicit_legacy(self):
         with patch.object(cg, 'cg_fetch', return_value=fixture()) as fetch:
             cg.coinglass_heatmap('BTC', 'Binance', '15', 288, original_symbol='BTCUSDT')
