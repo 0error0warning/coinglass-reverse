@@ -168,3 +168,56 @@ def test_text_partial_sentiment_does_not_keyerror(modules,monkeypatch,capsys):
     text=capsys.readouterr().out
     assert 'Binance: OI +1.0000%' in text
     assert 'OKX: error TimeoutError' in text
+
+
+def test_new_cg_adapters_are_not_default_sources(modules,monkeypatch):
+    m,_,_=modules
+    for name in ('spot_tickers','vpvr','liq_map','spot_premium','premium_trend','coinglass_heatmap','stablecoin','etf_flow','deribit_walls'):
+        monkeypatch.setattr(m,name,lambda *a,**k:None)
+    for name in m.CG_ADAPTER_SOURCE_NAMES:
+        monkeypatch.setattr(m,name,lambda *a,**k:(_ for _ in ()).throw(AssertionError(name)))
+    result=m.collect()
+    assert all(name not in result for name in m.CG_ADAPTER_SOURCE_NAMES)
+    assert all(name in result for name in m.DEFAULT_SOURCE_NAMES)
+
+
+def test_new_cg_adapter_sources_expose_status_and_provenance(modules,monkeypatch,capsys):
+    m,_,_=modules
+    payload={'status':'no_data','data':[],'metadata':{'endpoint':'/api/tradingData/whaleVsRetail','host':'capi','params':{'symbol':'BTC'},'received_ms':1,'metric':'whale_vs_retail','unit':'unverified_value','notes':'fixture'}}
+    monkeypatch.setattr(m,'cg_whale_vs_retail',lambda *a,**k:payload)
+    assert m.main(['BTC','--source','cg_whale_vs_retail','--json'])==0
+    out=json.loads(capsys.readouterr().out)
+    assert out['cg_whale_vs_retail']['status']=='no_data'
+    assert out['cg_whale_vs_retail']['data']['metadata']['endpoint']=='/api/tradingData/whaleVsRetail'
+
+
+def test_depth_source_uses_ticker_resolver_when_no_exact_instrument(modules,monkeypatch):
+    m,_,_=modules
+    calls=[]
+    monkeypatch.setattr(m,'resolve_pair_instrument',lambda base,exchange,quote='USDT',original_symbol=None:(calls.append((base,exchange,quote,original_symbol)) or ('KuCoin_XBTUSDTM',{'originalSymbol':'XBTUSDTM'})))
+    monkeypatch.setattr(m,'cg_depth_delta',lambda instrument,**kw:{'status':'ok','data':[[1]],'metadata':{'instrument':instrument,'params':kw}})
+    result=m.collect('BTC',sources=['cg_depth_delta'],adapter_options={'exchange':'KuCoin','quote':'USDT','original_symbol':'XBTUSDTM','depth':2,'interval':'15m','limit':300})
+    assert calls==[('BTC','KuCoin','USDT','XBTUSDTM')]
+    assert result['cg_depth_delta']['status']=='ok'
+    assert result['cg_depth_delta']['data']['metadata']['instrument']=='KuCoin_XBTUSDTM'
+
+
+def test_depth_source_accepts_exact_instrument_without_resolver(modules,monkeypatch):
+    m,_,_=modules
+    monkeypatch.setattr(m,'resolve_pair_instrument',lambda *a,**k:pytest.fail('resolver should not run'))
+    monkeypatch.setattr(m,'cg_depth_delta',lambda instrument,**kw:{'status':'ok','data':[[1]],'metadata':{'instrument':instrument,'params':kw}})
+    result=m.collect('BTC',sources=['cg_depth_delta'],adapter_options={'depth_instrument':'Binance_BTCUSDT'})
+    assert result['cg_depth_delta']['data']['metadata']['instrument']=='Binance_BTCUSDT'
+
+
+def test_new_cg_adapter_text_errors_are_safe(modules,monkeypatch,capsys):
+    m,_,_=modules
+    # market_scan does not import the class name directly; any typed exception attributes are still surfaced.
+    class TypedError(ValueError):
+        category='schema'
+        code='invalid_option_expiry'
+    monkeypatch.setattr(m,'cg_option_expiry',lambda *a,**k:(_ for _ in ()).throw(TypedError('signed-url-redacted')))
+    assert m.main(['BTC','--source','cg_option_expiry'])==1
+    text=capsys.readouterr().out
+    assert 'cg_option_expiry: error' in text
+    assert 'invalid_option_expiry' in text

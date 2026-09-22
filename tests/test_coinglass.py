@@ -192,6 +192,97 @@ class ClientTests(unittest.TestCase):
         with patch.object(cg, 'cg_fetch', return_value=[raw]):
             with self.assertRaises(dec.CoinGlassError): cg.cg_fear_greed()
 
+    def test_dedicated_adapter_exact_requests_and_envelopes(self):
+        cases = [
+            (cg.cg_whale_vs_retail, (), {},
+             '/api/tradingData/whaleVsRetail',
+             {'symbol': 'BTC', 'interval': '1d', 'limit': 1000},
+             [{'OpenPrice': '100', 'time': 1, 'closePrice': '101', 'value': '2'}],
+             'whale_vs_retail'),
+            (cg.cg_depth_delta, (), {},
+             '/api/v2/kline',
+             {'symbol': 'Binance_BTCUSDT#1#hundredth_depth', 'interval': '15m', 'limit': 300, 'minLimit': 'false'},
+             [[1, 2, 3, 4]],
+             'orderbook_depth_delta'),
+            (cg.cg_hyperliquid_liq_map, (), {},
+             '/api/hyperliquid/topPosition/liqMap',
+             {'symbol': 'BTC'},
+             {'price': 100, 'list': [{'price': 90}], 'rangeLow': 80, 'rangeHigh': 120},
+             'hyperliquid_top_position_liq_map'),
+            (cg.cg_option_net_premium, (), {},
+             '/api/option/netPremiumStrikeHeatmap',
+             {'symbol': 'BTC', 'ex': 'Deribit', 'time': '30d'},
+             {'data': [[1]], 'yList': [100000]},
+             'option_net_premium_strike_heatmap'),
+            (cg.cg_option_expiry, (), {},
+             '/api/option/v2/chart',
+             {'symbol': 'BTC', 'ex': 'Deribit', 'type': 'Delivery', 'subtype': 'ALL', 'currency': 'USD'},
+             {'data': {'keyList': ['270327'], 'callOiList': [2], 'putOiList': [3]}, 'keys': ['100000']},
+             'option_open_interest_by_expiry'),
+        ]
+        for func, args, kwargs, endpoint, params, raw, metric in cases:
+            with self.subTest(func=func.__name__), patch.object(cg, 'cg_fetch', return_value=raw) as fetch:
+                result = func(*args, **kwargs)
+                self.assertEqual(fetch.call_args.args, (endpoint, params))
+                self.assertEqual(fetch.call_args.kwargs, {'host': 'capi'})
+                self.assertEqual(result['status'], 'ok')
+                self.assertIs(result['data'], raw)
+                self.assertEqual(result['metadata']['endpoint'], endpoint)
+                self.assertEqual(result['metadata']['host'], 'capi')
+                self.assertEqual(result['metadata']['params'], params)
+                self.assertEqual(result['metadata']['metric'], metric)
+                self.assertIn('unit', result['metadata'])
+
+    def test_dedicated_adapter_empty_success_is_no_data(self):
+        empties = [
+            (cg.cg_whale_vs_retail, []),
+            (cg.cg_depth_delta, []),
+            (cg.cg_hyperliquid_liq_map, {'price': 100, 'list': []}),
+            (cg.cg_option_net_premium, {'data': [], 'yList': [1]}),
+            (cg.cg_option_expiry, {'data': {}, 'keys': ['100000']}),
+        ]
+        for func, raw in empties:
+            with self.subTest(func=func.__name__), patch.object(cg, 'cg_fetch', return_value=raw):
+                self.assertEqual(func()['status'], 'no_data')
+
+    def test_dedicated_adapter_schema_failures_are_typed(self):
+        cases = [
+            (cg.cg_whale_vs_retail, [{'OpenPrice': 1}]),
+            (cg.cg_depth_delta, [{'not': 'array'}]),
+            (cg.cg_hyperliquid_liq_map, {'price': 100, 'rows': []}),
+            (cg.cg_option_net_premium, {'data': [], 'y': []}),
+            (cg.cg_option_expiry, {'data': [], 'yList': []}),
+        ]
+        for func, raw in cases:
+            with self.subTest(func=func.__name__), patch.object(cg, 'cg_fetch', return_value=raw):
+                with self.assertRaises(dec.CoinGlassError) as caught:
+                    func()
+                self.assertEqual(caught.exception.category, 'schema')
+
+    def test_dedicated_adapter_validation_before_network(self):
+        invalid_calls = [
+            (cg.cg_whale_vs_retail, {'symbol': ''}),
+            (cg.cg_whale_vs_retail, {'limit': 0}),
+            (cg.cg_depth_delta, {'instrument': 'Binance_BTCUSDT#1#hundredth_depth'}),
+            (cg.cg_depth_delta, {'depth': 0}),
+            (cg.cg_depth_delta, {'limit': -1}),
+            (cg.cg_hyperliquid_liq_map, {'symbol': 'BTC/USDT'}),
+            (cg.cg_option_net_premium, {'exchange': ''}),
+            (cg.cg_option_expiry, {'currency': ''}),
+        ]
+        for func, kwargs in invalid_calls:
+            with self.subTest(func=func.__name__, kwargs=kwargs), patch.object(cg, 'cg_fetch') as fetch:
+                with self.assertRaises(ValueError):
+                    func(**kwargs)
+                fetch.assert_not_called()
+
+    def test_dedicated_adapter_propagates_business_transport_errors(self):
+        err = dec.CoinGlassError('permission', '40003', 'API rejected the request')
+        with patch.object(cg, 'cg_fetch', side_effect=err):
+            with self.assertRaises(dec.CoinGlassError) as caught:
+                cg.cg_option_expiry()
+            self.assertIs(caught.exception, err)
+
 
 class DecryptionTests(unittest.TestCase):
     def test_six_versions(self):

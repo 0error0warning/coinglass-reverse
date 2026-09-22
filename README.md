@@ -67,9 +67,14 @@ python market_scan.py --etf --json
 python market_scan.py BTC --source cg_heatmap --model 2 --window 48h --json
 python market_scan.py BTC --source cg_heatmap --model 3 --scope aggregate --window 3d
 python market_scan.py ETH --source premium --source deribit
+python market_scan.py BTC --source cg_whale_vs_retail --json
+python market_scan.py BTC --source cg_depth_delta --depth-instrument Binance_BTCUSDT --depth 1 --interval 15m --limit 300 --json
+python market_scan.py BTC --source cg_hyperliquid_liq_map --source cg_option_net_premium --source cg_option_expiry --json
 ```
 
 JSON reports have `schema_version=2`; each source has `status`, `data` or a typed `error`, and `as_of`. A failing source does not erase the other sources. `as_of` records the observation attempt, not necessarily the upstream data update time. Missing data is not zero. For row-shaped sources, `spot` and `sentiment` use source-specific aggregation: `ok` means all requested rows were usable, `partial` means usable rows were mixed with failed/no-data rows, `error` means no usable rows and at least one upstream error, and `no_data` means empty/all no-data. `not_configured` remains an optional skip for sources needing local configuration. Nonzero CLI exit status indicates one or more `error` or `partial` sources, while JSON remains readable.
+
+The five dedicated CoinGlass web adapters are named source choices but are not part of the default full scan, so `python market_scan.py BTC --json` keeps the pre-existing network surface. Empty successful adapter containers report `status="no_data"` and still include endpoint/parameter provenance.
 
 `--etf` selects only the **Farside BTC ETF HTML table (USD millions)**. This is distinct from `cg_etf_flow`, whose raw `changeUsd` is already USD. Other source names are listed in `--help`.
 
@@ -77,6 +82,22 @@ Coinalyze is optional: set `COINALYZE_KEY` or an explicitly chosen `MARKET_API_K
 
 ## Units and scope
 
+- **Dedicated CoinGlass adapters:** import directly from `coinglass_client`:
+
+```python
+from coinglass_client import (
+    cg_whale_vs_retail, cg_depth_delta, cg_hyperliquid_liq_map,
+    cg_option_net_premium, cg_option_expiry,
+)
+
+whales = cg_whale_vs_retail(symbol="BTC", interval="1d", limit=1000)
+depth = cg_depth_delta(instrument="Binance_BTCUSDT", depth=1, interval="15m", limit=300)
+hl = cg_hyperliquid_liq_map(symbol="BTC")
+premium = cg_option_net_premium(symbol="BTC", exchange="Deribit", window="30d")
+expiry = cg_option_expiry(symbol="BTC", exchange="Deribit", subtype="ALL", currency="USD")
+```
+
+  These use anonymously verified website paths, not an official API free-tier contract: `/api/tradingData/whaleVsRetail`, `/api/v2/kline`, `/api/hyperliquid/topPosition/liqMap`, `/api/option/netPremiumStrikeHeatmap`, and `/api/option/v2/chart`. Each returns `{"status", "data", "metadata"}` with raw keys preserved. Whale-vs-retail `value` has unverified formula/units and is not claimed as dollar flow or position notional. Depth delta preserves raw candle arrays for `symbol="{instrument}#{depth}#hundredth_depth"` with `minLimit=false`; it is orderbook delta, not traded CVD, and the caller supplies the exact instrument. Hyperliquid liquidation map is top-position-derived visible data, not guaranteed all accounts/exposures. Option net premium is not GEX. Option expiry is OI distribution by expiry, not Greeks/gamma/dealer exposure. Its response has a **dictionary** at `data`; align `data.callOiList`/`data.putOiList` with `data.keyList`. Top-level `keys` contains strike choices and is not the expiry axis. Raw OI, notional and market-value variants coexist: `currency=USD` does not make every returned field USD.
 - **ETF:** CoinGlass `changeUsd` is USD; `change` is asset quantity. `617600000` → `617.60M` is formatting only. Missing issuer fields are not confirmed zero. BTC and ETH use different endpoints.
 - **Funding:** a raw value of `0.01` means `0.01%`. Linear annualization needs the actual settlement interval; sampling `m5` is not a five-minute funding settlement. It is not realized/compound yield.
 - **Open interest:** `currency=USD/BTC` requests denomination, not collateral type. Do not convert a historical series with today's price or assume a single chart price reconstructs all venue values exactly.

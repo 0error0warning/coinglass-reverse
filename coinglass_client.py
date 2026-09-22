@@ -96,6 +96,121 @@ def _token(value, name):
     return value
 
 
+def _adapter_result(raw, *, endpoint, host, params, metric, unit, notes, no_data=False):
+    return {'status': 'no_data' if no_data else 'ok', 'data': raw, 'metadata': {
+        'endpoint': endpoint, 'host': host, 'params': dict(params),
+        'received_ms': int(time.time() * 1000), 'metric': metric,
+        'unit': unit, 'notes': notes}}
+
+
+def _list_of_dicts(raw, code, keys=()):
+    if not isinstance(raw, list) or any(not isinstance(row, dict) for row in raw):
+        raise CoinGlassError('schema', code, 'Expected array of objects')
+    for row in raw:
+        if any(key not in row for key in keys):
+            raise CoinGlassError('schema', code, 'Missing expected object keys')
+
+
+def _list_of_arrays(raw, code):
+    if not isinstance(raw, list) or any(not isinstance(row, (list, tuple)) for row in raw):
+        raise CoinGlassError('schema', code, 'Expected array of arrays')
+
+
+def _dict_with_lists(raw, code, keys):
+    if not isinstance(raw, dict) or any(not isinstance(raw.get(key), list) for key in keys):
+        raise CoinGlassError('schema', code, 'Expected object with known list containers')
+
+
+def resolve_pair_instrument(symbol='BTC', exchange='Binance', *, quote='USDT', original_symbol=None):
+    _token(symbol, 'symbol'); _token(exchange, 'exchange'); _token(quote, 'quote')
+    if original_symbol is not None:
+        _token(original_symbol, 'original_symbol')
+        return f'{exchange}_{original_symbol}', None
+    rows = cg_fetch('/api/futures/select/coins/tickers', {'keyword': symbol})
+    if not isinstance(rows, list):
+        raise CoinGlassError('schema', 'invalid_tickers', 'Ticker response must be an array')
+    matches = [r for r in rows if isinstance(r, dict) and r.get('exchangeName') == exchange
+               and r.get('symbol') == symbol and r.get('quoteCurrency') == quote]
+    ticker = _resolve_pair_ticker(matches, symbol, quote)
+    return f'{exchange}_{_token(ticker.get("originalSymbol"), "original_symbol")}', ticker
+
+
+def cg_whale_vs_retail(symbol='BTC', interval='1d', limit=1000):
+    _token(symbol, 'symbol'); _token(interval, 'interval'); _positive_int(limit, 'limit')
+    endpoint = '/api/tradingData/whaleVsRetail'
+    params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+    raw = cg_fetch(endpoint, params, host='capi')
+    _list_of_dicts(raw, 'invalid_whale_vs_retail', ('OpenPrice', 'time', 'closePrice', 'value'))
+    return _adapter_result(raw, endpoint=endpoint, host='capi', params=params,
+        metric='whale_vs_retail', unit='unverified_value',
+        notes='Preserves OpenPrice/time/closePrice/value. metric_formula unverified; value is not asserted to be dollar flow or position notional.',
+        no_data=not raw)
+
+
+def cg_depth_delta(instrument='Binance_BTCUSDT', depth=1, interval='15m', limit=300):
+    _token(instrument, 'instrument'); _token(interval, 'interval')
+    _positive_int(depth, 'depth'); _positive_int(limit, 'limit')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.:-]*_[A-Za-z0-9][A-Za-z0-9_.:-]*', instrument) or instrument.endswith('hundredth_depth'):
+        raise ValueError('instrument must be the exact exchange instrument without depth suffix')
+    endpoint = '/api/v2/kline'
+    params = {'symbol': f'{instrument}#{depth}#hundredth_depth', 'interval': interval,
+              'limit': limit, 'minLimit': 'false'}
+    raw = cg_fetch(endpoint, params, host='capi')
+    _list_of_arrays(raw, 'invalid_depth_delta')
+    return _adapter_result(raw, endpoint=endpoint, host='capi', params=params,
+        metric='orderbook_depth_delta', unit='unverified_depth_delta',
+        notes='Raw candle arrays are preserved. Orderbook delta is not traded CVD; OHLC indexes and units are unverified.',
+        no_data=not raw)
+
+
+def cg_hyperliquid_liq_map(symbol='BTC'):
+    _token(symbol, 'symbol')
+    endpoint = '/api/hyperliquid/topPosition/liqMap'
+    params = {'symbol': symbol}
+    raw = cg_fetch(endpoint, params, host='capi')
+    _dict_with_lists(raw, 'invalid_hyperliquid_liq_map', ('list',))
+    if 'price' not in raw:
+        raise CoinGlassError('schema', 'invalid_hyperliquid_liq_map', 'Missing price')
+    return _adapter_result(raw, endpoint=endpoint, host='capi', params=params,
+        metric='hyperliquid_top_position_liq_map', unit='unverified_top_position_exposure',
+        notes='Visible top-position-derived map only; not guaranteed to cover all venue accounts or exposures. No account profiling or automated trading semantics.',
+        no_data=not raw.get('list'))
+
+
+def cg_option_net_premium(symbol='BTC', exchange='Deribit', window='30d'):
+    _token(symbol, 'symbol'); _token(exchange, 'exchange'); _token(window, 'window')
+    endpoint = '/api/option/netPremiumStrikeHeatmap'
+    params = {'symbol': symbol, 'ex': exchange, 'time': window}
+    raw = cg_fetch(endpoint, params, host='capi')
+    _dict_with_lists(raw, 'invalid_option_net_premium', ('data', 'yList'))
+    return _adapter_result(raw, endpoint=endpoint, host='capi', params=params,
+        metric='option_net_premium_strike_heatmap', unit='unverified_net_premium',
+        notes='Raw axes are preserved. Net premium signs and units are unverified; this is not GEX.',
+        no_data=not raw.get('data') or not raw.get('yList'))
+
+
+def cg_option_expiry(symbol='BTC', exchange='Deribit', subtype='ALL', currency='USD'):
+    _token(symbol, 'symbol'); _token(exchange, 'exchange'); _token(subtype, 'subtype'); _token(currency, 'currency')
+    endpoint = '/api/option/v2/chart'
+    params = {'symbol': symbol, 'ex': exchange, 'type': 'Delivery',
+              'subtype': subtype, 'currency': currency}
+    raw = cg_fetch(endpoint, params, host='capi')
+    _dict_with_lists(raw, 'invalid_option_expiry', ('keys',))
+    series = raw.get('data')
+    if not isinstance(series, dict):
+        raise CoinGlassError('schema', 'invalid_option_expiry', 'Expected expiry series object')
+    if series:
+        _dict_with_lists(series, 'invalid_option_expiry', ('keyList', 'callOiList', 'putOiList'))
+        if any(len(series[k]) != len(series['keyList']) for k in ('callOiList', 'putOiList')):
+            raise CoinGlassError('schema', 'invalid_option_expiry', 'Expiry series and axis lengths differ')
+    result = _adapter_result(raw, endpoint=endpoint, host='capi', params=params,
+        metric='option_open_interest_by_expiry', unit='mixed_raw_series_units',
+        notes='Expiry axis is data.keyList, not top-level keys (strike choices). Raw OI and notional/market-value variants coexist; currency does not make every field USD. Not Greeks, gamma exposure, or dealer exposure.',
+        no_data=not series or not series.get('keyList'))
+    result['metadata']['axis_path'] = 'data.keyList'
+    return result
+
+
 
 def _resolve_pair_ticker(matches, symbol, quote):
     """Pick one pair instrument from ticker search hits.
@@ -149,14 +264,9 @@ def coinglass_heatmap(symbol='BTC', exchange='Binance', interval=None, limit=Non
             raise ValueError('original_symbol is only valid for pair scope')
     if scope == 'pair':
         if original_symbol is None:
-            rows = cg_fetch('/api/futures/select/coins/tickers', {'keyword': symbol})
-            if not isinstance(rows, list):
-                raise CoinGlassError('schema', 'invalid_tickers', 'Ticker response must be an array')
-            matches = [r for r in rows if isinstance(r, dict) and r.get('exchangeName') == exchange
-                       and r.get('symbol') == symbol and r.get('quoteCurrency') == quote]
-            ticker = _resolve_pair_ticker(matches, symbol, quote)
-            original_symbol = _token(ticker.get('originalSymbol'), 'original_symbol')
-        request_symbol = f'{exchange}_{original_symbol}'
+            request_symbol, ticker = resolve_pair_instrument(symbol, exchange, quote=quote)
+        else:
+            request_symbol, _ = resolve_pair_instrument(symbol, exchange, quote=quote, original_symbol=original_symbol)
     else:
         request_symbol = symbol
     params = {'symbol': request_symbol, 'merge': 'true'}
