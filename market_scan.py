@@ -26,6 +26,8 @@ try:
         cg_liquidation_chart, cg_liquidation_info, cg_etf_flow, cg_ahr999,
         cg_fear_greed, cg_open_interest_chart, cg_option_chart,
         cg_option_max_pain, cg_exchange_balance, cg_spot_markets, cg_rsi,
+        cg_whale_vs_retail, cg_depth_delta, cg_hyperliquid_liq_map,
+        cg_option_net_premium, cg_option_expiry, resolve_pair_instrument,
         annualize_funding_percent,
     )
     CG_AVAILABLE = True
@@ -402,20 +404,49 @@ def _source(call, name=None):
 
 
 SOURCE_NAMES=('spot','sentiment','vpvr','liq_map','premium','premium_trend','cg_heatmap','deribit','etf','stablecoin')
+CG_ADAPTER_SOURCE_NAMES=('cg_whale_vs_retail','cg_depth_delta','cg_hyperliquid_liq_map','cg_option_net_premium','cg_option_expiry')
+DEFAULT_SOURCE_NAMES=SOURCE_NAMES
+ALL_SOURCE_NAMES=SOURCE_NAMES+CG_ADAPTER_SOURCE_NAMES
 
 
-def collect(base='BTC', sources=None, heatmap_options=None):
+def _adapter_exchange(options, default):
+    return (options or {}).get('exchange') or default
+
+
+def _depth_instrument(base, options):
+    options=options or {}
+    if options.get('depth_instrument'):
+        return options['depth_instrument']
+    instrument, _ = resolve_pair_instrument(base, _adapter_exchange(options, 'Binance'),
+                                            quote=options.get('quote', 'USDT'),
+                                            original_symbol=options.get('original_symbol'))
+    return instrument
+
+
+def collect(base='BTC', sources=None, heatmap_options=None, adapter_options=None):
     base=base.upper()
     if not re.fullmatch(r'[A-Z0-9]+',base):raise ValueError('invalid base asset')
-    selected=list(sources) if sources is not None else list(SOURCE_NAMES)
-    if any(name not in SOURCE_NAMES for name in selected):raise ValueError('unknown source')
+    selected=list(sources) if sources is not None else list(DEFAULT_SOURCE_NAMES)
+    if any(name not in ALL_SOURCE_NAMES for name in selected):raise ValueError('unknown source')
+    adapter_options=adapter_options or {}
     calls={'spot':lambda:spot_tickers((base+'USDT','ETHUSDT')),
            'sentiment':lambda:scan_sentiment(base),'vpvr':lambda:vpvr(base+'USDT'),
            'liq_map':lambda:liq_map(base+'USDT'),'premium':lambda:spot_premium(base),
            'premium_trend':lambda:premium_trend(base),
            'cg_heatmap':lambda:coinglass_heatmap(base,**(heatmap_options or {})),
            'deribit':lambda:deribit_walls(currency=base) if base in ('BTC','ETH') else None,
-           'etf':lambda:etf_flow() if base=='BTC' else None,'stablecoin':stablecoin}
+           'etf':lambda:etf_flow() if base=='BTC' else None,'stablecoin':stablecoin,
+           'cg_whale_vs_retail':lambda:cg_whale_vs_retail(base,
+               interval=adapter_options.get('interval', '1d'), limit=adapter_options.get('limit', 1000)),
+           'cg_depth_delta':lambda:cg_depth_delta(_depth_instrument(base, adapter_options),
+               depth=adapter_options.get('depth', 1), interval=adapter_options.get('interval', '15m'),
+               limit=adapter_options.get('limit', 300)),
+           'cg_hyperliquid_liq_map':lambda:cg_hyperliquid_liq_map(base),
+           'cg_option_net_premium':lambda:cg_option_net_premium(base,
+               exchange=_adapter_exchange(adapter_options, 'Deribit'), window=adapter_options.get('window', '30d')),
+           'cg_option_expiry':lambda:cg_option_expiry(base,
+               exchange=_adapter_exchange(adapter_options, 'Deribit'),
+               subtype=adapter_options.get('subtype', 'ALL'), currency=adapter_options.get('currency', 'USD'))}
     out={'schema_version':2,'base':base,'ts':datetime.now(timezone.utc).isoformat()}
     for name in selected:
         if name=='sentiment' and not CY and not os.environ.get('MARKET_API_KEY_FILE'):
@@ -430,13 +461,17 @@ def main(argv=None):
     parser.add_argument('base',nargs='?',default='BTC')
     parser.add_argument('--json',action='store_true')
     parser.add_argument('--etf',action='store_true',help='Farside BTC ETF only, values are USD millions')
-    parser.add_argument('--source',action='append',choices=SOURCE_NAMES)
+    parser.add_argument('--source',action='append',choices=ALL_SOURCE_NAMES)
     parser.add_argument('--model',choices=('1','2','3','legacy'),default='1')
     parser.add_argument('--scope',choices=('pair','aggregate'),default='pair')
     parser.add_argument('--window')
-    parser.add_argument('--exchange',default='Binance')
+    parser.add_argument('--exchange')
     parser.add_argument('--quote',default='USDT')
     parser.add_argument('--original-symbol')
+    parser.add_argument('--depth-instrument')
+    parser.add_argument('--depth',type=int)
+    parser.add_argument('--subtype')
+    parser.add_argument('--currency')
     parser.add_argument('--interval')
     parser.add_argument('--limit',type=int)
     args=parser.parse_args(argv)
@@ -444,16 +479,22 @@ def main(argv=None):
     if args.window and (args.interval is not None or args.limit is not None):parser.error('--window conflicts with --interval/--limit')
     base=args.base.upper()
     if base.endswith('USDT'):base=base[:-4]
-    options={'model':args.model if args.model=='legacy' else int(args.model),'scope':args.scope,'exchange':args.exchange,'quote':args.quote}
+    options={'model':args.model if args.model=='legacy' else int(args.model),'scope':args.scope,'quote':args.quote}
+    if args.exchange is not None:options['exchange']=args.exchange
     for key in ('window','original_symbol','interval','limit'):
         value=getattr(args,key)
         if value is not None:options[key]=value
-    out=collect('BTC' if args.etf else base,sources=['etf'] if args.etf else args.source,heatmap_options=options)
+    adapter_options={'quote':args.quote}
+    for key in ('exchange','original_symbol','depth_instrument','depth','subtype','currency','interval','limit','window'):
+        value=getattr(args,key)
+        if value is not None:adapter_options[key]=value
+    out=collect('BTC' if args.etf else base,sources=['etf'] if args.etf else args.source,
+                heatmap_options=options,adapter_options=adapter_options)
     if args.json:
         print(json.dumps(out,ensure_ascii=False,default=str,allow_nan=False))
     else:
         print(f'# {out["base"]} market scan — {out["ts"]}')
-        for name in (n for n in out if n in SOURCE_NAMES):
+        for name in (n for n in out if n in ALL_SOURCE_NAMES):
             item=out[name];data=item.get('data')
             if item['status']!='ok' and not (item['status']=='partial' and name in ('spot','sentiment')):
                 print(f'## {name}: {item["status"]} {item.get("error",{})}');continue
@@ -471,7 +512,7 @@ def main(argv=None):
             elif name=='spot':
                 print(f'## spot ({item["status"]})\n'+json.dumps(data,ensure_ascii=False,default=str))
             else:print(f'## {name}\n'+json.dumps(data,ensure_ascii=False,default=str))
-    return 1 if any(out[n]['status'] in ('error','partial') for n in out if n in SOURCE_NAMES) else 0
+    return 1 if any(out[n]['status'] in ('error','partial') for n in out if n in ALL_SOURCE_NAMES) else 0
 
 
 if __name__=='__main__':
