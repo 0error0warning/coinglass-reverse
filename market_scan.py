@@ -329,13 +329,70 @@ def print_cg_heatmap(result, symbol):
             print(f'  {format_price(price):>14} {intensity:>14,.2f} {"█"*int(intensity/maximum*12)}')
 
 
-def _source(call):
+def _spot_status(data):
+    if not data:
+        return 'no_data'
+    usable = 0
+    errors = 0
+    no_data = 0
+    for row in data.values():
+        if isinstance(row, dict) and row.get('status') == 'error':
+            errors += 1
+        elif isinstance(row, dict) and row.get('status') == 'no_data':
+            no_data += 1
+        elif isinstance(row, dict) and row.get('p') is not None:
+            usable += 1
+        else:
+            no_data += 1
+    if usable and not errors and not no_data:
+        return 'ok'
+    if usable:
+        return 'partial'
+    if errors:
+        return 'error'
+    return 'no_data'
+
+
+def _sentiment_status(data):
+    if not data:
+        return 'no_data'
+    usable = 0
+    errors = 0
+    no_data = 0
+    fields = ('oi_chg', 'long_liq', 'short_liq', 'ls', 'fr')
+    for row in data:
+        if isinstance(row, dict) and row.get('status') == 'error':
+            errors += 1
+        elif isinstance(row, dict) and row.get('status') == 'no_data':
+            no_data += 1
+        elif isinstance(row, dict) and any(row.get(key) is not None for key in fields):
+            usable += 1
+        else:
+            no_data += 1
+    if usable and not errors and not no_data:
+        return 'ok'
+    if usable:
+        return 'partial'
+    if errors:
+        return 'error'
+    return 'no_data'
+
+
+def _aggregate_source_status(name, data):
+    if isinstance(data, dict) and data.get('status') in ('ok', 'partial', 'error', 'legacy_untyped', 'no_data', 'not_configured'):
+        return data['status']
+    if name == 'spot' and isinstance(data, dict):
+        return _spot_status(data)
+    if name == 'sentiment' and isinstance(data, list):
+        return _sentiment_status(data)
+    return 'no_data' if data is None or data == [] or data == {} else 'ok'
+
+
+def _source(call, name=None):
     stamp=datetime.now(timezone.utc).isoformat()
     try:
         data=call()
-        if isinstance(data,dict) and data.get('status') in ('error','legacy_untyped','no_data'):
-            return {'status':data['status'],'data':data,'as_of':stamp}
-        return {'status':'no_data' if data is None or data==[] or data=={} else 'ok','data':data,'as_of':stamp}
+        return {'status':_aggregate_source_status(name, data),'data':data,'as_of':stamp}
     except Exception as exc:
         # Exception messages may embed signed query strings: return typed safe diagnostics.
         error={'type':type(exc).__name__}
@@ -364,7 +421,7 @@ def collect(base='BTC', sources=None, heatmap_options=None):
         if name=='sentiment' and not CY and not os.environ.get('MARKET_API_KEY_FILE'):
             out[name]={'status':'not_configured','data':None,'as_of':out['ts']}
         else:
-            out[name]=_source(calls[name])
+            out[name]=_source(calls[name], name)
     return out
 
 
@@ -398,14 +455,23 @@ def main(argv=None):
         print(f'# {out["base"]} market scan — {out["ts"]}')
         for name in (n for n in out if n in SOURCE_NAMES):
             item=out[name];data=item.get('data')
-            if item['status']!='ok':print(f'## {name}: {item["status"]} {item.get("error",{})}');continue
+            if item['status']!='ok' and not (item['status']=='partial' and name in ('spot','sentiment')):
+                print(f'## {name}: {item["status"]} {item.get("error",{})}');continue
             if name=='cg_heatmap':print_cg_heatmap(data,base)
             elif name=='liq_map':print_liq_map(data,base+'USDT')
             elif name=='sentiment':
-                print('## selected perpetual sentiment; liquidation unit USD')
-                for row in data:print(f'{row["ex"]}: OI {format_percent(row.get("oi_chg"))}, funding {format_percent(row.get("fr"))}, long {row.get("long_liq")}, short {row.get("short_liq")}')
+                print(f'## selected perpetual sentiment ({item["status"]}); liquidation unit USD')
+                for row in data:
+                    if row.get('status') == 'error':
+                        print(f'{row.get("ex","unknown")}: error {row.get("error_type","Error")}')
+                    elif row.get('status') == 'no_data':
+                        print(f'{row.get("ex","unknown")}: no_data')
+                    else:
+                        print(f'{row.get("ex","unknown")}: OI {format_percent(row.get("oi_chg"))}, funding {format_percent(row.get("fr"))}, long {row.get("long_liq")}, short {row.get("short_liq")}')
+            elif name=='spot':
+                print(f'## spot ({item["status"]})\n'+json.dumps(data,ensure_ascii=False,default=str))
             else:print(f'## {name}\n'+json.dumps(data,ensure_ascii=False,default=str))
-    return 1 if any(out[n]['status']=='error' for n in out if n in SOURCE_NAMES) else 0
+    return 1 if any(out[n]['status'] in ('error','partial') for n in out if n in SOURCE_NAMES) else 0
 
 
 if __name__=='__main__':

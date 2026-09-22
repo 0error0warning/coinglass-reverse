@@ -1,7 +1,9 @@
 """Offline synthetic fixtures, not captured exchange traffic."""
 import importlib
+import io
 import json
 import threading
+from unittest.mock import patch
 import pytest
 
 
@@ -174,3 +176,82 @@ def test_ack_subscription_and_iterative_reconnect(tmp_path):
     assert len(seen) == 3
     assert seen[0].subscription['params'] == ['!forceOrder@arr']
     assert collector.status['binance']['acknowledged'] is True
+
+
+def test_health_file_atomic_and_separate_from_event_glob(tmp_path):
+    c = importlib.import_module('liq_collector')
+    collector = c.Collector(tmp_path)
+    collector.update_source('binance', connected=True, acknowledged=True)
+    collector.write_health(now_ms=1700000000000)
+    health = tmp_path/'_health'/'status.json'
+    assert health.exists()
+    data = json.loads(health.read_text())
+    assert data['updated_ms'] == 1700000000000
+    assert data['sources']['binance']['connected'] is True
+    assert [p.name for p in tmp_path.glob('*.json')] == []
+    event = normalizers().normalize_bybit({'topic':'allLiquidation.BTCUSDT', 'data':[{'s':'BTCUSDT','S':'Buy','v':'2','p':'99000','T':1700000000000}]})[0]
+    collector.record(event)
+    collector.flush_once(now_ms=1700000000001)
+    assert sorted(p.name for p in tmp_path.glob('*.json')) == ['BTCUSDT.json']
+
+
+def test_health_reports_failed_flush_and_closed_source(tmp_path, monkeypatch):
+    c = importlib.import_module('liq_collector')
+    collector = c.Collector(tmp_path)
+    collector.update_source('okx', connected=True, acknowledged=False)
+    collector.update_source('okx', connected=False)
+    collector.increment_source_error('okx')
+    collector.record(normalizers().normalize_binance(bn())[0])
+    monkeypatch.setattr(c.os, 'replace', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
+    assert collector.flush_once(now_ms=1700000000001)['errors']
+    snap = collector.health_snapshot(now_ms=1700000000002)
+    assert snap['pending_count'] == 1
+    assert snap['sources']['okx']['connected'] is False
+    assert snap['sources']['okx']['acknowledged'] is False
+    assert snap['sources']['okx']['errors'] == 1
+    assert snap['persistence']['records_accepted'] == 1
+    assert snap['persistence']['flush_errors'] == 1
+
+
+def test_source_health_records_ack_stop_and_real_event(tmp_path):
+    c = importlib.import_module('liq_collector')
+    stop = threading.Event()
+    class Fake:
+        def __init__(self, url, **callbacks): self.cb = callbacks
+        def send(self, msg): pass
+        def close(self): pass
+        def run_forever(self, **kwargs):
+            self.cb['on_open'](self)
+            self.cb['on_message'](self, '{"result":null,"id":1}')
+            self.cb['on_message'](self, json.dumps(bn()))
+            self.cb['on_close'](self, 1000, 'done')
+            stop.set()
+    collector = c.Collector(tmp_path)
+    c.run_source('binance', collector, stop, ws_factory=Fake, backoff=0)
+    snap = collector.health_snapshot()
+    assert snap['sources']['binance']['acknowledged'] is True
+    assert snap['sources']['binance']['connected'] is False
+    assert snap['sources']['binance']['last_accepted_event_ms'] is not None
+    assert snap['pending_count'] == 1
+
+
+def test_okx_instruments_uses_public_user_agent_and_parses_metadata():
+    c = importlib.import_module('liq_collector')
+    payload = {'code':'0','data':[
+        {'instId':'BTC-USDT-SWAP','ctVal':'.01','ctMult':'1'},
+        {'instId':'DOGE-USDT-SWAP','ctVal':'1000','ctMult':'1'},
+    ]}
+    class Response(io.StringIO):
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+    seen = {}
+    def fake_urlopen(request, timeout):
+        seen['url'] = request.full_url
+        seen['headers'] = dict(request.header_items())
+        return Response(json.dumps(payload))
+    with patch.object(c, 'urlopen', fake_urlopen):
+        result = c.load_okx_instruments(symbols=('BTCUSDT',))
+    assert seen['url'] == 'https://www.okx.com/api/v5/public/instruments?instType=SWAP'
+    assert seen['headers']['User-agent'] == 'Mozilla/5.0'
+    assert result['BTC-USDT-SWAP']['ctVal'] == '.01'
+    assert 'DOGE-USDT-SWAP' not in result

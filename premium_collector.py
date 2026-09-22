@@ -9,6 +9,8 @@ import logging
 import math
 import os
 import sqlite3
+import signal
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -63,15 +65,19 @@ def collect_once(conn):
 
 def main(stop_event=None):
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
+    owned_stop = stop_event is None
+    if owned_stop:
+        stop_event = threading.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *a: stop_event.set())
     conn=init_db()
     try:
-        while stop_event is None or not stop_event.is_set():
+        while not stop_event.is_set():
             try:collect_once(conn)
             except Exception as exc:log.error('collection/retention failed (%s)',type(exc).__name__)
-            if stop_event is not None:
-                if stop_event.wait(INTERVAL):break
-            else:time.sleep(INTERVAL)
+            if stop_event.wait(INTERVAL):break
     except KeyboardInterrupt:
+        if owned_stop: stop_event.set()
         pass
     finally:conn.close()
 

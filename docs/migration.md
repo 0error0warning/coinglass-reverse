@@ -12,6 +12,8 @@ Old files stored `qty` without its unit and used local receipt time. Some OKX va
 
 The reader excludes untyped legacy data. The collector must refuse to overwrite legacy/corrupt files and retain pending events on a flush error; use a clean path rather than losing or guessing old data.
 
+Operational health is written atomically to `LIQ_STATE_DIR/_health/status.json`. The `_health` subdirectory is deliberate so scanners that read root `*.json` symbol event files never mistake health for market data. Use this health file to check whether each source is connected and acknowledged, whether errors are increasing, whether genuine events have been accepted, and whether persistence is flushing. `last_accepted_event_ms` is absent/null until a real normalized event is recorded; it is not fabricated during quiet market periods.
+
 ## Event contract
 
 - `schema_version`: 2 on the file and event.
@@ -43,6 +45,7 @@ Even additive observations are only the events covered by that upstream feed. Bu
 ## Other compatibility changes
 
 - `collect()` / CLI JSON now use source envelopes: `status`, `data/error`, `as_of`. Update code that directly indexed `report['cg_heatmap']['by_price']` to inspect status then `report['cg_heatmap']['data']['by_price']`.
+- `spot` and `sentiment` use explicit collection status aggregation: all usable rows are `ok`, usable rows mixed with failed/no-data rows are `partial`, all empty/no-data rows are `no_data`, and all failed/no usable rows are `error`. CLI exits nonzero for `error` or `partial`; `not_configured` remains an optional skip.
 - `coinglass_heatmap()` retains the first four positional inputs. Current model 1 is default; select legacy explicitly if required. Latest-slice profile replaces historical summation. Raw response and provenance are preserved.
 - `spot` in the heatmap remains only a documented compatibility alias for contract candle close.
 - API business/transport/schema errors are explicit exceptions, not silently `None` or successful error dictionaries.

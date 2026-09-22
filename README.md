@@ -69,7 +69,7 @@ python market_scan.py BTC --source cg_heatmap --model 3 --scope aggregate --wind
 python market_scan.py ETH --source premium --source deribit
 ```
 
-JSON reports have `schema_version=2`; each source has `status`, `data` or a typed `error`, and `as_of`. A failing source does not erase the other sources. `as_of` records the observation attempt, not necessarily the upstream data update time. Missing data is not zero. Nonzero CLI exit status indicates one or more failed sources, while JSON remains readable.
+JSON reports have `schema_version=2`; each source has `status`, `data` or a typed `error`, and `as_of`. A failing source does not erase the other sources. `as_of` records the observation attempt, not necessarily the upstream data update time. Missing data is not zero. For row-shaped sources, `spot` and `sentiment` use source-specific aggregation: `ok` means all requested rows were usable, `partial` means usable rows were mixed with failed/no-data rows, `error` means no usable rows and at least one upstream error, and `no_data` means empty/all no-data. `not_configured` remains an optional skip for sources needing local configuration. Nonzero CLI exit status indicates one or more `error` or `partial` sources, while JSON remains readable.
 
 `--etf` selects only the **Farside BTC ETF HTML table (USD millions)**. This is distinct from `cg_etf_flow`, whose raw `changeUsd` is already USD. Other source names are listed in `--help`.
 
@@ -100,6 +100,8 @@ PREMIUM_STATE_DIR=/path/to/premium-state python premium_collector.py
 Default locations are under `~/.local/state/coinglass/`. Set paths explicitly when migrating a deployment. No automatic service installation or production migration is included.
 
 Liquidation schema v2 stores raw units, normalized base quantity, exchange/receive times, position direction and price/quantity semantics. **Legacy mixed-unit files must not be silently converted.** Binance cumulative filled snapshots without reliable order identity are retained as non-additive observations and excluded from economic totals; sampled feeds cannot prove a complete liquidation ledger. OKX quantities require instrument metadata; unknown contracts fail closed. See the migration guide before pointing a new collector at an existing directory.
+
+The liquidation collector also writes operational health to `LIQ_STATE_DIR/_health/status.json` using atomic replace. This file is intentionally outside the root symbol-file glob. It reports each source's connected/ACK/error state, last accepted event time when one has actually arrived, pending buffer count, accepted record count, flush errors and last flush/persist timestamps. A quiet but connected feed is different from a failed ACK or dead source; no synthetic liquidation events are created to prove liveness.
 
 ## Protocol and verification boundaries
 

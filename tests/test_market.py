@@ -3,12 +3,10 @@ import importlib.util
 import json
 import pathlib
 import sys
-from unittest.mock import patch
 
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-REAL_PATH = pathlib.Path
 
 
 @pytest.fixture
@@ -19,22 +17,13 @@ def modules(tmp_path, monkeypatch):
     monkeypatch.delenv('COINALYZE_KEY', raising=False)
     monkeypatch.delenv('MARKET_API_KEY_FILE', raising=False)
     sys.path.insert(0, str(ROOT))
-    class SafePath(type(REAL_PATH())):
-        def __new__(cls, *args, **kwargs):
-            if args and str(args[0]).startswith('/var/lib/upi-hermes'):
-                args = (str(tmp_path) + str(args[0])[len('/var/lib/upi-hermes'):], *args[1:])
-            return super().__new__(cls, *args, **kwargs)
-        @classmethod
-        def home(cls):
-            return cls(tmp_path)
     loaded=[]
-    with patch('pathlib.Path', SafePath):
-        for name in ('market_scan', 'premium_collector'):
-            spec=importlib.util.spec_from_file_location('audit_'+name,ROOT/f'{name}.py')
-            assert spec is not None and spec.loader is not None
-            module=importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            loaded.append(module)
+    for name in ('market_scan', 'premium_collector'):
+        spec=importlib.util.spec_from_file_location('audit_'+name,ROOT/f'{name}.py')
+        assert spec is not None and spec.loader is not None
+        module=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        loaded.append(module)
     yield (*loaded,tmp_path)
     sys.path.remove(str(ROOT))
 
@@ -135,3 +124,47 @@ def test_premium_semantics_explicit(modules,monkeypatch):
     result=m.spot_premium()
     assert result['fx_adjusted'] is False
     assert result['metric']=='usd_spot_minus_usdt_perpetual'
+
+
+def test_spot_source_aggregate_statuses(modules):
+    m,_,_=modules
+    assert m._source(lambda:{}, 'spot')['status']=='no_data'
+    assert m._source(lambda:{'BTCUSDT':{'p':100,'chg':1}}, 'spot')['status']=='ok'
+    assert m._source(lambda:{'BTCUSDT':{'status':'error','error_type':'TimeoutError'}}, 'spot')['status']=='error'
+    assert m._source(lambda:{'BTCUSDT':{'p':100,'chg':1},'ETHUSDT':{'status':'error','error_type':'TimeoutError'}}, 'spot')['status']=='partial'
+    assert m._source(lambda:{'status':'legacy_untyped','error':'old'}, 'liq_map')['status']=='legacy_untyped'
+
+
+def test_sentiment_source_aggregate_statuses(modules):
+    m,_,_=modules
+    good={'ex':'Binance','oi_chg':1,'long_liq':2,'short_liq':3,'ls':None,'fr':.01}
+    err={'ex':'OKX','status':'error','error_type':'TimeoutError'}
+    nd={'ex':'Bybit','status':'no_data'}
+    assert m._source(lambda:[], 'sentiment')['status']=='no_data'
+    assert m._source(lambda:[good], 'sentiment')['status']=='ok'
+    assert m._source(lambda:[err], 'sentiment')['status']=='error'
+    assert m._source(lambda:[nd], 'sentiment')['status']=='no_data'
+    assert m._source(lambda:[good,err], 'sentiment')['status']=='partial'
+    assert m._source(lambda:[good,nd], 'sentiment')['status']=='partial'
+
+
+def test_cli_json_partial_exits_nonzero(modules,monkeypatch,capsys):
+    m,_,_=modules
+    monkeypatch.setattr(m,'spot_tickers',lambda *a,**k:{'BTCUSDT':{'p':100,'chg':1},'ETHUSDT':{'status':'error','error_type':'TimeoutError'}})
+    assert m.main(['BTC','--source','spot','--json'])==1
+    out=json.loads(capsys.readouterr().out)
+    assert out['spot']['status']=='partial'
+    assert out['spot']['data']['ETHUSDT']['error_type']=='TimeoutError'
+
+
+def test_text_partial_sentiment_does_not_keyerror(modules,monkeypatch,capsys):
+    m,_,_=modules
+    monkeypatch.setattr(m,'scan_sentiment',lambda *a,**k:[
+        {'ex':'Binance','oi_chg':1,'long_liq':2,'short_liq':3,'ls':None,'fr':.01},
+        {'ex':'OKX','status':'error','error_type':'TimeoutError'},
+    ])
+    m.CY='fixture-key'
+    assert m.main(['BTC','--source','sentiment'])==1
+    text=capsys.readouterr().out
+    assert 'Binance: OI +1.0000%' in text
+    assert 'OKX: error TimeoutError' in text
