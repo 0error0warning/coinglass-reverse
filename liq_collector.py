@@ -1,158 +1,212 @@
 #!/usr/bin/env python3
-"""liq_collector.py — 爆仓流常驻收集器
+"""Public liquidation collector, schema 2. Import has no filesystem/network effects.
 
-订阅:
-  - Binance fapi WS  !forceOrder@arr  (全市场爆仓推送)
-  - Bybit v5 WS      liquidation      (BTCUSDT/ETHUSDT 等)
-  - OKX v5 WS        liquidation-orders (币本位+USDT 永续)
-
-输出: ~/.hermes/state/liq_map/{symbol}.json
-  {"events": [{ts, ex, price, qty, side}],  # side: 'long'=多爆 'short'=空爆
-   "updated": ts}
-每桶在读取端按价格分桶,收集端只存原始事件,72h 滑动窗口.
-
-运行:
-  python3 liq_collector.py            # 前台
-  systemd unit: liq-collector.service
+LIQ_STATE_DIR defaults to ~/.local/state/coinglass/liq_map. Legacy/corrupt files
+are preserved and block replacement; move them aside explicitly to start fresh.
+Single writer per state directory. Fingerprint dedup is not exchange-ID identity.
 """
-import json, os, sys, time, threading, logging
+import copy
+import json
+import logging
+import os
 from pathlib import Path
+import signal
+import tempfile
+import threading
+import time
+from urllib.request import urlopen
 from collections import defaultdict
-from logging.handlers import RotatingFileHandler
+from liquidation_events import (DEFAULT_SYMBOLS, normalize_binance,
+                                normalize_bybit, normalize_okx, valid_event)
 
-try:
-    import websocket  # websocket-client
-except ImportError:
-    print('need websocket-client: uv pip install --python ~/.venvs/liq/bin/python websocket-client')
-    sys.exit(1)
-
-STATE_DIR = Path('/var/lib/upi-hermes/.hermes/state/liq_map')
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-LOG = STATE_DIR/'collector.log'
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(message)s',
-    handlers=[
-        RotatingFileHandler(LOG, maxBytes=1_000_000, backupCount=2),
-        logging.StreamHandler()
-    ]
-)
+STATE_DIR = Path(os.environ.get('LIQ_STATE_DIR', str(Path.home()/'.local/state/coinglass/liq_map')))
+SYMBOLS = sorted(DEFAULT_SYMBOLS)
+MAX_EVENTS_PER_SYM = 50000
 log = logging.getLogger('liq')
 
-# 内存事件缓存 — {symbol: [events]}
-_store = defaultdict(list)
-_lock = threading.Lock()
-SYMBOLS = ['BTCUSDT','ETHUSDT','SOLUSDT','UNIUSDT','ZECUSDT','TAOUSDT','SUIUSDT','HYPEUSDT']
-MAX_EVENTS_PER_SYM = 50000  # 防爆内存
 
-def record(symbol, exchange, price, qty, side):
-    """side: 'BUY'=空单被爆(强平买入) / 'SELL'=多单被爆(强平卖出)"""
-    ev = {'ts': int(time.time()), 'ex': exchange, 'price': price, 'qty': qty,
-          'side': 'short' if side in ('BUY','Buy') else 'long'}
-    with _lock:
-        _store[symbol].append(ev)
-        if len(_store[symbol]) > MAX_EVENTS_PER_SYM:
-            _store[symbol] = _store[symbol][-MAX_EVENTS_PER_SYM//2:]
+class Collector:
+    def __init__(self, state_dir=None, *, retention_ms=72*3600000, max_events=MAX_EVENTS_PER_SYM):
+        self.state_dir = Path(state_dir) if state_dir is not None else STATE_DIR
+        self.retention_ms = retention_ms
+        self.max_events = max_events
+        self._store = defaultdict(list)
+        self._lock = threading.RLock()
+        self.status = {}
 
-def flush():
-    """每 60s 把内存事件追加到磁盘,合并并按 72h 滑动窗口裁剪"""
-    while True:
-        time.sleep(60)
-        wrote = []
-        with _lock:
-            cutoff = int(time.time()) - 72*3600
-            for sym, evs in _store.items():
-                if not evs: continue
-                f = STATE_DIR/f'{sym}.json'
-                old_evs = []
-                if f.exists():
-                    try: old_evs = json.loads(f.read_text()).get('events',[])
-                    except Exception: pass
-                merged = old_evs + evs
-                merged = [e for e in merged if e['ts'] > cutoff]
-                tmp = f.with_suffix('.tmp')
-                tmp.write_text(json.dumps({'events':merged,'updated':int(time.time())}))
-                tmp.replace(f)
-                wrote.append(f'{sym}(+{len(evs)})')
-                _store[sym] = []
-        if wrote:
-            log.info(f'flushed: {" ".join(wrote)}')
+    @property
+    def pending_count(self):
+        with self._lock: return sum(map(len, self._store.values()))
 
-# ---- Binance ----
-def binance_ws():
-    url = 'wss://fstream.binance.com/ws/!forceOrder@arr'
-    def on_msg(ws,msg):
+    def record(self, event):
+        if not valid_event(event):
+            log.warning('reject invalid schema-2 event'); return False
+        with self._lock:
+            events = self._store[event['symbol']]
+            if any(e['event_id'] == event['event_id'] for e in events): return False
+            if len(events) >= self.max_events:
+                log.error('buffer full for %s; incoming event rejected', event['symbol']); return False
+            events.append(copy.deepcopy(event))
+        return True
+
+    def flush_once(self, *, now_ms=None):
+        now = int(time.time()*1000) if now_ms is None else int(now_ms)
+        result = {'written': [], 'errors': {}}
         try:
-            d = json.loads(msg)
-            o = d.get('o',{})
-            sym = o.get('s'); side = o.get('S')
-            price = float(o.get('p',0)); qty = float(o.get('q',0))
-            if sym and price and qty:
-                record(sym, 'binance', price, qty, side)
-        except Exception: pass
-    def on_err(ws,e): log.error(f'binance ws err {e}')
-    def on_close(ws,*a):
-        log.info('binance ws closed, reconnect in 5s'); time.sleep(5); binance_ws()
-    ws = websocket.WebSocketApp(url, on_message=on_msg, on_error=on_err, on_close=on_close)
-    ws.run_forever(ping_interval=20)
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error('state directory unavailable: %s', exc)
+            result['errors']['state_dir'] = str(exc); return result
+        with self._lock:
+            symbols = set(self._store) | {p.stem for p in self.state_dir.glob('*.json')}
+            for sym in sorted(symbols):
+                path = self.state_dir / (sym + '.json')
+                tmp = None
+                try:
+                    old = []
+                    if path.exists():
+                        data = json.loads(path.read_text())
+                        if not isinstance(data, dict) or data.get('schema_version') != 2 or not isinstance(data.get('events'), list):
+                            raise ValueError('legacy/corrupt file preserved; explicit migration required')
+                        if any(not valid_event(e) or e['symbol'] != sym for e in data['events']):
+                            raise ValueError('invalid schema-2 records; original file preserved')
+                        old = data['events']
+                    merged = {}
+                    for event in old + self._store[sym]:
+                        if now-self.retention_ms <= event['exchange_ts_ms'] <= now:
+                            merged.setdefault(event['event_id'], event)
+                    events = sorted(merged.values(), key=lambda e:e['exchange_ts_ms'])
+                    if len(events) > self.max_events:
+                        log.warning('disk retention capped for %s; oldest events removed', sym)
+                        events = events[-self.max_events:]
+                    with tempfile.NamedTemporaryFile('w', dir=self.state_dir, prefix='.'+sym, suffix='.tmp', delete=False) as f:
+                        tmp = f.name
+                        json.dump({'schema_version':2, 'events':events, 'updated_ms':now}, f, allow_nan=False)
+                        f.flush(); os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                    self._store.pop(sym, None)
+                    result['written'].append(sym)
+                except (OSError, ValueError, TypeError) as exc:
+                    log.error('flush %s failed; buffer retained: %s', sym, exc)
+                    result['errors'][sym] = str(exc)
+                finally:
+                    if tmp and os.path.exists(tmp):
+                        try: os.unlink(tmp)
+                        except OSError: log.warning('cannot clean temporary file %s', tmp)
+        return result
 
-# ---- Bybit ----
-def bybit_ws():
-    url = 'wss://stream.bybit.com/v5/public/linear'
-    def on_open(ws):
-        for s in SYMBOLS:
-            ws.send(json.dumps({'op':'subscribe','args':[f'liquidation.{s}']}))
-        log.info('bybit subscribed')
-    def on_msg(ws,msg):
+    def flush(self, stop_event, interval=60):
+        while not stop_event.wait(interval): self.flush_once()
+        self.flush_once()
+
+
+def load_okx_instruments(symbols=DEFAULT_SYMBOLS):
+    """Public metadata lookup outside callbacks, refreshed each reconnection."""
+    with urlopen('https://www.okx.com/api/v5/public/instruments?instType=SWAP', timeout=15) as response:
+        data = json.load(response)
+    if str(data.get('code')) != '0': raise ValueError('OKX instruments request failed')
+    return {r['instId']:r for r in data['data'] if r['instId'].replace('-SWAP','').replace('-','') in symbols}
+
+
+def run_source(source, collector, stop_event, *, instruments=None, ws_factory=None, backoff=5, ack_timeout=15):
+    if stop_event.is_set(): return
+    if ws_factory is None:
+        import websocket
+        websocket.setdefaulttimeout(15)
+        ws_factory = websocket.WebSocketApp
+    urls = {'binance':'wss://fstream.binance.com/market/ws',
+            'bybit':'wss://stream.bybit.com/v5/public/linear',
+            'okx':'wss://ws.okx.com:8443/ws/v5/public'}
+    subscription = {'binance':{'method':'SUBSCRIBE','params':['!forceOrder@arr'],'id':1},
+                    'bybit':{'op':'subscribe','args':['allLiquidation.'+s for s in SYMBOLS], 'req_id':'liq'},
+                    'okx':{'op':'subscribe','args':[{'channel':'liquidation-orders','instType':'SWAP'}]}}[source]
+    attempt = 0
+    while not stop_event.is_set():
+        status = {'acknowledged':False, 'connected':False, 'errors':0}
+        collector.status[source] = status
         try:
-            d = json.loads(msg)
-            if d.get('topic','').startswith('liquidation.'):
-                data = d.get('data',{})
-                sym = data.get('symbol'); side = data.get('side')
-                price = float(data.get('price',0)); qty = float(data.get('size',0))
-                if sym and price and qty:
-                    record(sym, 'bybit', price, qty, side)
-        except Exception: pass
-    def on_err(ws,e): log.error(f'bybit ws err {e}')
-    def on_close(ws,*a):
-        log.info('bybit ws closed, reconnect in 5s'); time.sleep(5); bybit_ws()
-    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_msg, on_error=on_err, on_close=on_close)
-    ws.run_forever(ping_interval=20)
+            metadata = instruments if instruments is not None else (load_okx_instruments() if source == 'okx' else {})
+            done = threading.Event()
+            opened = threading.Event()
+            opened_at = [0.0]
+            def on_open(ws):
+                status['connected'] = True
+                opened_at[0] = time.monotonic(); opened.set()
+                ws.send(json.dumps(subscription))
+            def on_message(ws, message):
+                if message == 'pong': return
+                try:
+                    data = json.loads(message)
+                    if not isinstance(data, (dict, list)): raise ValueError('invalid message shape')
+                    if isinstance(data, dict):
+                        if data.get('event') == 'error' or data.get('success') is False or ('code' in data and str(data['code']) != '0'):
+                            raise ValueError('subscription/server error: '+str(data.get('msg', data.get('ret_msg', data.get('code'))))[:180])
+                        ack = ((source == 'binance' and data.get('id') == 1 and 'result' in data and data['result'] is None)
+                               or (source == 'bybit' and data.get('op') == 'subscribe' and data.get('success') is True)
+                               or (source == 'okx' and data.get('event') == 'subscribe' and data.get('arg') == subscription['args'][0]))
+                        if ack:
+                            status['acknowledged'] = True; log.info('%s subscription ACK', source); return
+                    if source == 'binance': events = normalize_binance(data)
+                    elif source == 'bybit': events = normalize_bybit(data)
+                    else: events = normalize_okx(data, metadata)
+                    for event in events: collector.record(event)
+                    if events: status['last_event_ms'] = int(time.time()*1000)
+                except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                    status['errors'] += 1
+                    log.warning('%s message rejected: %s', source, str(exc)[:200])
+            def on_error(ws, error):
+                status['errors'] += 1; log.error('%s websocket error: %s', source, str(error)[:200])
+            def on_close(ws, *args):
+                status['connected'] = False; log.info('%s closed', source)
+            ws = ws_factory(urls[source], on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+            def watch():
+                last_ping = time.monotonic()
+                while not done.wait(.1):
+                    if stop_event.is_set(): ws.close(); return
+                    if opened.is_set() and not status['acknowledged'] and time.monotonic()-opened_at[0] >= ack_timeout:
+                        status['errors'] += 1; log.error('%s subscription ACK timeout', source); ws.close(); return
+                    if source == 'okx' and opened.is_set() and time.monotonic()-last_ping > 20:
+                        try: ws.send('ping')
+                        except Exception as exc: on_error(ws, exc); ws.close(); return
+                        last_ping = time.monotonic()
+            watcher = threading.Thread(target=watch, daemon=True); watcher.start()
+            try: ws.run_forever(ping_interval=20, ping_timeout=10)
+            finally:
+                done.set(); ws.close(); watcher.join(timeout=1)
+            attempt = 0 if status['acknowledged'] else min(attempt+1, 5)
+        except Exception as exc:
+            status['errors'] += 1; log.error('%s source failed: %s', source, str(exc)[:200])
+            attempt = min(attempt+1, 5)
+        if stop_event.wait(min(60, backoff * (2**attempt))): return
 
-# ---- OKX ----
-# OKX 用 instFamily 订阅,比如 BTC-USDT 会覆盖 BTC-USDT-SWAP
-def okx_ws():
-    url = 'wss://ws.okx.com:8443/ws/v5/public'
-    families = ['BTC-USDT','ETH-USDT','SOL-USDT','UNI-USDT','ZEC-USDT','TAO-USDT','SUI-USDT','HYPE-USDT']
-    def on_open(ws):
-        args = [{'channel':'liquidation-orders','instFamily':f} for f in families]
-        ws.send(json.dumps({'op':'subscribe','args':args}))
-        log.info('okx subscribed')
-    def on_msg(ws,msg):
-        try:
-            d = json.loads(msg)
-            if d.get('arg',{}).get('channel')=='liquidation-orders':
-                for data in d.get('data',[]):
-                    inst = data.get('instId','')  # e.g. BTC-USDT-SWAP
-                    sym = inst.replace('-SWAP','').replace('-','')
-                    for detail in data.get('details',[]):
-                        price = float(detail.get('bkPx',0) or 0)
-                        qty = float(detail.get('sz',0) or 0)
-                        side = detail.get('posSide','')  # 'long' or 'short'
-                        if sym and price and qty:
-                            # OKX posSide 直接给多/空,反向映射回 BUY/SELL 语义
-                            record(sym, 'okx', price, qty, 'BUY' if side=='short' else 'SELL')
-        except Exception: pass
-    def on_err(ws,e): log.error(f'okx ws err {e}')
-    def on_close(ws,*a):
-        log.info('okx ws closed, reconnect in 5s'); time.sleep(5); okx_ws()
-    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_msg, on_error=on_err, on_close=on_close)
-    ws.run_forever(ping_interval=25, ping_payload='ping')
 
-if __name__=='__main__':
-    log.info('liq_collector start')
-    threading.Thread(target=flush, daemon=True).start()
-    threading.Thread(target=bybit_ws, daemon=True).start()
-    threading.Thread(target=okx_ws, daemon=True).start()
-    binance_ws()
+_default = None
+
+def _collector():
+    global _default
+    if _default is None: _default = Collector()
+    return _default
+
+def record(event): return _collector().record(event)
+def flush_once(**kwargs): return _collector().flush_once(**kwargs)
+def flush(stop_event=None): return _collector().flush(stop_event or threading.Event())
+def binance_ws(stop_event=None): return run_source('binance', _collector(), stop_event or threading.Event())
+def bybit_ws(stop_event=None): return run_source('bybit', _collector(), stop_event or threading.Event())
+def okx_ws(stop_event=None): return run_source('okx', _collector(), stop_event or threading.Event())
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM): signal.signal(sig, lambda *a: stop.set())
+    collector = Collector()
+    threads = [threading.Thread(target=run_source, args=(s,collector,stop), daemon=True) for s in ('binance','bybit','okx')]
+    threads.append(threading.Thread(target=collector.flush, args=(stop,), daemon=True))
+    for thread in threads: thread.start()
+    while not stop.wait(1):
+        if any(not t.is_alive() for t in threads):
+            log.error('collector worker died; stopping'); stop.set()
+    for thread in threads: thread.join(timeout=20)
+    collector.flush_once()
+
+if __name__ == '__main__': main()
