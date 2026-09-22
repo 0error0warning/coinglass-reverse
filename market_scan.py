@@ -1,544 +1,478 @@
 #!/usr/bin/env python3
-"""market_scan.py — 加密市场情绪全聚合扫描 (免费数据源)
+"""Read-only market scanner. Units, source status and sampling limits are explicit.
 
-一条命令出完整报告:
-  1. 四所合约情绪 (Coinalyze): OI变化 / 清算 / 多空比 / 资金费率
-  2. Deribit 期权 gamma 墙: 按行权价的 call/put OI 分布 + max pain
-  3. DefiLlama 稳定币: 总量 + 7日增减
-  4. ETF 净流入: Farside 昨日数据 (反爬已处理)
-  5. BTC 现货价格 + 24h
-
-用法:
-  python3 market_scan.py            # BTC 全景
-  python3 market_scan.py UNIUSDT    # 单币种 (Coinalyze only)
-  python3 market_scan.py --etf      # 只看 ETF
+Examples: python market_scan.py BTC --json
+          python market_scan.py --etf
+          python market_scan.py BTC --source cg_heatmap --model 2 --window 48h
 """
-import urllib.request, urllib.parse, urllib.error
-import json, os, sys, time, re, hmac, hashlib, struct, base64
-from pathlib import Path
+import argparse
+import json
+import math
+import os
+import re
+import sqlite3
+import time
+import urllib.parse
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
+from liquidation_events import valid_event
 
-# CoinGlass 内部 API 解密 (coinglass-decrypt)
-sys.path.insert(0, str(Path(__file__).parent))
 try:
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import pad
-    from coinglass_decrypt import fetch_and_decrypt
+    from coinglass_client import (
+        _cg_totp, _cg_data_param, cg_fetch, coinglass_heatmap,
+        cg_home_stats, cg_oi_change_rank, cg_coin_markets, cg_funding_chart,
+        cg_liquidation_chart, cg_liquidation_info, cg_etf_flow, cg_ahr999,
+        cg_fear_greed, cg_open_interest_chart, cg_option_chart,
+        cg_option_max_pain, cg_exchange_balance, cg_spot_markets, cg_rsi,
+        annualize_funding_percent,
+    )
     CG_AVAILABLE = True
 except ImportError:
     CG_AVAILABLE = False
+    def coinglass_heatmap(*args, **kwargs):
+        raise RuntimeError('CoinGlass dependencies are unavailable; install requirements.txt')
 
-HOME = Path('/var/lib/upi-hermes')
-KEY_FILE = HOME/'.hermes/secrets/market-apis.env'
-UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
-
-def _key(name):
-    if not KEY_FILE.exists(): return None
-    for line in KEY_FILE.read_text().splitlines():
-        if line.startswith(name+'='):
-            return line.split('=',1)[1].strip()
-    return None
-
-CY = _key('COINALYZE_KEY')
+UA = 'Mozilla/5.0 (compatible; CoinGlassReverse/2)'
+# No implicit reads of a particular user's credentials or import-time I/O.
+CY = os.environ.get('COINALYZE_KEY')
 EX_NAME = {'A':'Binance','6':'Bybit','3':'OKX','4':'HTX','H':'Hyperliquid','S':'Aster'}
+_markets_cache = None
+
 
 def get(url, headers=None, timeout=20):
     h = {'User-Agent': UA, 'Accept': '*/*'}
-    if headers: h.update(headers)
-    req = urllib.request.Request(url, headers=h)
-    return urllib.request.urlopen(req, timeout=timeout).read()
+    h.update(headers or {})
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as response:
+        return response.read()
+
 
 def cy_get(path):
-    if not CY: return None
-    return json.loads(get('https://api.coinalyze.net'+path, {'api-key':CY}, 25))
+    key = CY
+    explicit = os.environ.get('MARKET_API_KEY_FILE')
+    if not key and explicit:
+        for line in Path(explicit).read_text().splitlines():
+            if line.startswith('COINALYZE_KEY='):
+                key = line.split('=',1)[1].strip()
+                break
+    if not key:
+        raise RuntimeError('COINALYZE_KEY is not configured')
+    return json.loads(get('https://api.coinalyze.net'+path, {'api_key':key}, 25))
 
-# ============ 1. Coinalyze 四所情绪 ============
-_markets_cache = None
+
 def find_perp(base, quote='USDT'):
     global _markets_cache
     if _markets_cache is None:
-        _markets_cache = cy_get('/v1/future-markets') or []
+        _markets_cache = cy_get('/v1/future-markets')
+    if not isinstance(_markets_cache,list):
+        raise ValueError('Coinalyze markets response is not a list')
     want = base.upper()+quote
-    out = {}
-    for m in _markets_cache:
-        if m.get('symbol_on_exchange','').replace('-','')==want and m.get('is_perpetual') and m.get('margined')=='STABLE':
-            out[m['exchange']] = m['symbol']
-    return out
+    return {m['exchange']:m['symbol'] for m in _markets_cache
+            if m.get('symbol_on_exchange','').replace('-','')==want
+            and m.get('is_perpetual') and m.get('margined')=='STABLE'}
+
 
 def hist(symbol, endpoint, hours=24):
-    now = int(time.time()); frm = now - hours*3600
-    d = cy_get(f'/v1/{endpoint}?symbols={symbol}&interval=4hour&from={frm}&to={now}')
-    if d and isinstance(d,list):
-        return d[0].get('history',[])
-    return []
+    if not isinstance(hours,(int,float)) or not 0 < hours <= 24*365:
+        raise ValueError('hours must be positive and <= 8760')
+    now = int(time.time())
+    params={'symbols':symbol,'interval':'4hour','from':now-int(hours*3600),'to':now}
+    if endpoint in ('liquidation-history','open-interest-history'):
+        params['convert_to_usd']='true'
+    d=cy_get('/v1/'+endpoint+'?'+urllib.parse.urlencode(params))
+    if not isinstance(d,list):
+        raise ValueError('Coinalyze history response is not a list')
+    return d[0].get('history',[]) if d else []
+
 
 def scan_sentiment(base='BTC', quote='USDT', hours=24):
-    perps = find_perp(base, quote)
-    rows = []
-    for ex in ['A','6','3','H']:
-        sym = perps.get(ex)
-        if not sym: continue
+    rows=[]
+    for ex,sym in find_perp(base,quote).items():
+        if ex not in ('A','6','3','H'):
+            continue
         try:
-            oi  = hist(sym,'open-interest-history',hours)
-            lq  = hist(sym,'liquidation-history',hours)
-            lsr = hist(sym,'long-short-ratio-history',hours)
-            fr  = hist(sym,'funding-rate-history',hours)
-            oi_chg = (oi[-1]['c']/oi[0]['o']-1)*100 if len(oi)>=2 and oi[0]['o'] else None
-            long_liq = sum(x.get('l',0) for x in lq)
-            short_liq= sum(x.get('s',0) for x in lq)
-            ls_now = (lsr[-1].get('l'), lsr[-1].get('s')) if lsr else None
-            fr_now = fr[-1]['c'] if fr else None
-            rows.append({'ex':EX_NAME.get(ex,ex),'oi_chg':oi_chg,'long_liq':long_liq,
-                         'short_liq':short_liq,'ls':ls_now,'fr':fr_now})
-            time.sleep(0.3)
-        except Exception as e:
-            rows.append({'ex':EX_NAME.get(ex,ex),'err':str(e)[:50]})
+            oi=hist(sym,'open-interest-history',hours)
+            lq=hist(sym,'liquidation-history',hours)
+            lsr=hist(sym,'long-short-ratio-history',hours)
+            fr=hist(sym,'funding-rate-history',hours)
+            rows.append({'ex':EX_NAME.get(ex,ex),
+                         'oi_chg':(oi[-1]['c']/oi[0]['o']-1)*100 if len(oi)>=2 and oi[0].get('o') else None,
+                         'long_liq':sum(x['l'] for x in lq) if lq and all(x.get('l') is not None for x in lq) else None,
+                         'short_liq':sum(x['s'] for x in lq) if lq and all(x.get('s') is not None for x in lq) else None,
+                         'ls':(lsr[-1].get('l'),lsr[-1].get('s')) if lsr else None,
+                         'fr':fr[-1].get('c') if fr else None,
+                         'liquidation_unit':'USD','oi_change_unit':'percent','funding_unit':'percent',
+                         'coverage':'selected stable-margined perpetuals; upstream history may be incomplete'})
+        except Exception as exc:
+            rows.append({'ex':EX_NAME.get(ex,ex),'status':'error','error_type':type(exc).__name__})
     return rows
 
-# ============ 2. Deribit gamma 墙 ============
-def deribit_walls():
-    """返回 {spot, nearest_expiry, strikes:{strike:{call,put}}, max_pain, total_oi}"""
-    d = json.loads(get('https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option', timeout=30))
-    res = d.get('result',[])
-    if not res: return None
-    spot = res[0].get('estimated_delivery_price')
-    # 找最近到期日 (OI 最大的)
-    ex_oi = defaultdict(float)
-    for o in res:
-        ex_oi[o['instrument_name'].split('-')[1]] += o.get('open_interest') or 0
-    expiry = max(ex_oi, key=ex_oi.get)
-    # 按行权价聚合该到期日
-    strikes = defaultdict(lambda:{'call':0.0,'put':0.0})
-    for o in res:
-        p = o['instrument_name'].split('-')
-        if p[1]!=expiry: continue
-        s = float(p[2]); cp = 'call' if p[3]=='C' else 'put'
-        strikes[s][cp] += o.get('open_interest') or 0
-    # max pain
-    max_pain, min_v = None, None
-    for c in strikes:
-        v = sum(max(0,c-s)*v_['call'] + max(0,s-c)*v_['put'] for s,v_ in strikes.items())
-        if min_v is None or v<min_v: max_pain,min_v = c,v
-    return {'spot':spot,'expiry':expiry,'strikes':dict(strikes),'max_pain':max_pain,'total_oi':ex_oi[expiry]}
 
-# ============ 3. DefiLlama 稳定币 ============
+def deribit_walls(currency='BTC', expiry_policy='max_oi', expiry=None, now=None):
+    """OI distribution, NOT gamma/dealer exposure. Select a documented expiry policy."""
+    if currency not in ('BTC','ETH') or expiry_policy not in ('max_oi','nearest'):
+        raise ValueError('unsupported currency or expiry policy')
+    now=now or datetime.now(timezone.utc)
+    data=json.loads(get('https://www.deribit.com/api/v2/public/get_book_summary_by_currency?'+urllib.parse.urlencode({'currency':currency,'kind':'option'}),timeout=30))
+    if 'error' in data:
+        raise ValueError('Deribit business error')
+    instruments=[];totals=defaultdict(float);dates={}
+    for item in data.get('result',[]):
+        parts=item.get('instrument_name','').split('-')
+        if len(parts)!=4 or parts[0]!=currency or parts[3] not in ('C','P'):
+            continue
+        try:
+            dt=datetime.strptime(parts[1],'%d%b%y').replace(hour=8,tzinfo=timezone.utc)
+            strike=float(parts[2]); oi=float(item.get('open_interest') or 0)
+        except (ValueError,TypeError):
+            continue
+        if dt<=now or not all(math.isfinite(x) and x>=0 for x in (strike,oi)):
+            continue
+        instruments.append((parts,item,strike,oi)); totals[parts[1]]+=oi;dates[parts[1]]=dt
+    if expiry is not None and expiry not in totals:
+        raise ValueError('requested expiry has no available unexpired instruments')
+    if not totals:
+        return None
+    selected=expiry or (min(dates,key=lambda key:dates[key]) if expiry_policy=='nearest' else max(totals,key=lambda key:totals[key]))
+    strikes=defaultdict(lambda:{'call':0.,'put':0.});reference=None
+    for parts,item,strike,oi in instruments:
+        if parts[1]==selected:
+            strikes[strike]['call' if parts[3]=='C' else 'put']+=oi
+            reference=item.get('estimated_delivery_price',reference)
+    pain=min(strikes,key=lambda price:sum(max(0,price-s)*v['call']+max(0,s-price)*v['put'] for s,v in strikes.items()))
+    return {'spot':reference,'reference_price':reference,'expiry':selected,'expiry_policy':'explicit' if expiry else expiry_policy,
+            'strikes':dict(strikes),'max_pain':pain,'total_oi':totals[selected],'unit':currency,
+            'metric':'open_interest_distribution','max_pain_method':'simplified terminal intrinsic-value objective; not a forecast'}
+
+
 def stablecoin():
-    for _ in range(2):
-        try:
-            rows = json.loads(get('https://stablecoins.llama.fi/stablecoincharts/all', timeout=40))
-            if not isinstance(rows,list) or not rows: return None
-            def tot(r): return (r.get('totalCirculating') or {}).get('peggedUSD')
-            cur = tot(rows[-1])
-            target = time.time() - 7*86400
-            past = tot(min(rows, key=lambda r: abs(float(r.get('date') or 0)-target)))
-            return {'total_b': cur/1e9, 'delta_7d_b': (cur-past)/1e9 if past else None}
-        except Exception:
-            time.sleep(1)
-    return None
+    rows=json.loads(get('https://stablecoins.llama.fi/stablecoincharts/all',timeout=30))
+    if not isinstance(rows,list) or not rows:
+        return None
+    target=time.time()-7*86400
+    cur=(rows[-1].get('totalCirculating') or {}).get('peggedUSD')
+    past=(min(rows,key=lambda r:abs(float(r.get('date') or 0)-target)).get('totalCirculating') or {}).get('peggedUSD')
+    if cur is None:
+        return None
+    return {'total_b':cur/1e9,'delta_7d_b':(cur-past)/1e9 if past is not None else None,'unit':'billion_USD'}
 
-# ============ 4. Farside ETF ============
+
 def etf_flow():
-    """Farside BTC ETF 表 — 解析最近几日总净流入 (USD mn)"""
-    try:
-        html = get('https://farside.co.uk/btc/', {'Referer':'https://farside.co.uk/'}, 30).decode('utf-8','ignore')
-    except Exception:
-        return None
-    # 找 Total 列的日数据
-    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S)
-    out = []
-    for r in rows:
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', r, re.S)
-        cells = [re.sub(r'<[^>]+>|\s+',' ',c).strip() for c in cells]
-        if len(cells) >= 2 and re.match(r'\d{1,2}\s+\w+', cells[0]):
+    """Farside HTML table strings (USD millions); NOT CoinGlass changeUsd units."""
+    html=get('https://farside.co.uk/btc/',{'Referer':'https://farside.co.uk/'},30).decode('utf-8','ignore')
+    out=[]
+    for row in re.findall(r'<tr[^>]*>(.*?)</tr>',html,re.S):
+        cells=[re.sub(r'<[^>]+>|\s+',' ',c).strip() for c in re.findall(r'<td[^>]*>(.*?)</td>',row,re.S)]
+        if len(cells)>=2 and re.match(r'\d{1,2}\s+\w+',cells[0]):
             out.append(cells)
-    return out[-7:]  # 表按日期升序, 最后7天是最新
+    return out[-7:]
 
-# ============ 5. VPVR 成交密集区 (30d 成交量分布) ============
-def vpvr(symbol='BTCUSDT', days=30, step=None, window_pct=0.08):
-    """Volume Profile: 每价位成交量分布 — POC 只在现价 ±window_pct 内找"""
-    try:
-        ks = json.loads(get(f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1h&limit={days*24}', timeout=25))
-        price = float(json.loads(get(f'https://api.binance.com/api/v3/ticker/price?symbol={symbol}', timeout=10))['price'])
-    except Exception:
-        return None
+
+def vpvr(symbol='BTCUSDT', days=30, step=None, window_pct=.08):
+    """Approximate OHLCV volume allocation, not executed volume-at-price."""
+    if not isinstance(days,int) or isinstance(days,bool) or not 1<=days<=41:
+        raise ValueError('days must be 1..41 (Binance maximum 1000 hourly bars)')
+    if not 0<window_pct<=1 or (step is not None and (not math.isfinite(step) or step<=0)):
+        raise ValueError('invalid VPVR step/window')
+    params=urllib.parse.urlencode({'symbol':symbol,'interval':'1h','limit':days*24})
+    candles=json.loads(get('https://api.binance.com/api/v3/klines?'+params,timeout=25))
+    price=float(json.loads(get('https://api.binance.com/api/v3/ticker/price?'+urllib.parse.urlencode({'symbol':symbol}),timeout=10))['price'])
+    if not math.isfinite(price) or price<=0:
+        raise ValueError('invalid reference price')
     if step is None:
-        step = 500 if price > 10000 else max(round(price*0.005,4), 0.001)
-    vol_at = defaultdict(float)
-    for k in ks:
-        h,l,v = float(k[2]),float(k[3]),float(k[5])
-        if h>l:
-            lo_b,hi_b = int(l/step),int(h/step)
-            for b in range(lo_b,hi_b+1):
-                vol_at[b*step] += v/(hi_b-lo_b+1)
-    # POC 只在现价附近窗口内找 — 30天前远在的历史巨量不误导
-    lo,hi = price*(1-window_pct), price*(1+window_pct)
-    local = {b:v for b,v in vol_at.items() if lo<=b<=hi}
-    poc = max(local, key=local.get) if local else max(vol_at, key=vol_at.get)
-    return {'price':price,'step':step,'vol':dict(vol_at),'poc':poc}
+        step=500 if price>10000 else max(price*.005,1e-12)
+    volume=defaultdict(float)
+    for k in candles:
+        high,low,qty=float(k[2]),float(k[3]),float(k[5])
+        if not all(math.isfinite(x) for x in (high,low,qty)) or low<0 or high<low or qty<0:
+            continue
+        left,right=int(low/step),int(high/step)
+        if right-left>100000:
+            raise ValueError('step too small for candle range')
+        for b in range(left,right+1):
+            volume[b*step]+=qty/(right-left+1)
+    if not volume:
+        return None
+    local={b:v for b,v in volume.items() if price*(1-window_pct)<=b<=price*(1+window_pct)}
+    poc=max(local or volume,key=lambda key:(local or volume)[key])
+    return {'price':price,'step':step,'vol':dict(volume),'poc':poc,'unit':'base_asset','method':'uniform OHLC range approximation'}
 
-def render_vpvr(v, pct=0.06, topn=14):
-    """渲染 ±pct 内的成交量带"""
-    price,step,vol,poc = v['price'],v['step'],v['vol'],v['poc']
-    lo,hi = price*(1-pct), price*(1+pct)
-    band = {b:vv for b,vv in vol.items() if lo<=b<=hi}
-    top = sorted(band.items(), key=lambda x:-x[1])[:topn]
-    mx = top[0][1] if top else 1
-    lines = []
-    for b,vv in sorted(top, reverse=True):
-        tag = 'POC' if b==poc else ('▲上方' if b>price else '▼下方')
-        bar = '▮'*max(1,int(vv/mx*22))
-        mark = ' ←现价' if abs(b-price)<step/2 else ''
-        lines.append(f'  {b:>10,.2f} {vv:>8,.0f} {bar} {tag}{mark}')
-    return lines
 
-# ============ 6. 现货 ============
+def render_vpvr(v, pct=.06, topn=14):
+    price,step,volume,poc=v['price'],v['step'],v['vol'],v['poc']
+    top=sorted(((b,q) for b,q in volume.items() if price*(1-pct)<=b<=price*(1+pct)),key=lambda x:-x[1])[:topn]
+    maximum=max((q for _,q in top),default=0) or 1
+    return [f'  {format_price(b):>14} {q:>12,.2f} {"▮"*int(q/maximum*22)} {"POC" if b==poc else ""}' for b,q in sorted(top,reverse=True)]
+
+
 def spot_tickers(symbols=('BTCUSDT','ETHUSDT')):
-    out = {}
-    for s in symbols:
+    out={}
+    for symbol in dict.fromkeys(symbols):
         try:
-            d = json.loads(get(f'https://api.binance.com/api/v3/ticker/24hr?symbol={s}', timeout=10))
-            out[s] = {'p':float(d['lastPrice']),'chg':float(d['priceChangePercent'])}
-        except Exception: pass
+            data=json.loads(get('https://api.binance.com/api/v3/ticker/24hr?'+urllib.parse.urlencode({'symbol':symbol}),timeout=10))
+            out[symbol]={'p':float(data['lastPrice']),'chg':float(data['priceChangePercent'])}
+        except Exception as exc:
+            out[symbol]={'status':'error','error_type':type(exc).__name__}
     return out
+
 
 def premium_trend(base='BTC', hours=24):
-    """从 premium.db 读溢价历史,算 EMA20 和趋势
-    返回 {'current':最新溢价, 'ema20':20期EMA, 'trend':'↑/↓/→', 'pctile':当前溢价在24h的分位}
-    """
-    db = Path('/var/lib/upi-hermes/.hermes/state/premium/premium.db')
-    if not db.exists(): return None
-    try:
-        import sqlite3
-        conn = sqlite3.connect(db)
-        rows = conn.execute(
-            'SELECT ts,pct FROM premium WHERE sym=? AND ts>? ORDER BY ts',
-            (base, int(time.time())-hours*3600)).fetchall()
-        conn.close()
-        if not rows: return None
-        vals = [r[1] for r in rows]
-        # EMA20
-        ema = vals[0]
-        k = 2/(20+1)
-        for v in vals[1:]: ema = v*k + ema*(1-k)
-        cur = vals[-1]
-        # 分位
-        srt = sorted(vals)
-        pctile = srt.index(min(srt, key=lambda x:abs(x-cur)))/len(srt)*100
-        trend = '↑' if cur>ema else ('↓' if cur<ema else '→')
-        return {'current':cur,'ema20':ema,'trend':trend,'pctile':pctile,'n':len(vals)}
-    except Exception as e:
-        return {'err':str(e)}
+    db=Path(os.environ.get('PREMIUM_STATE_DIR',str(Path.home()/'.local/state/coinglass/premium')))/'premium.db'
+    if not db.exists():
+        return None
+    with sqlite3.connect(f'{db.resolve().as_uri()}?mode=ro',uri=True) as conn:
+        rows=conn.execute('SELECT ts,pct FROM premium WHERE sym=? AND ts>? ORDER BY ts',(base,int(time.time())-hours*3600)).fetchall()
+    if not rows:
+        return None
+    values=[r[1] for r in rows];ema=values[0];k=2/21
+    for value in values[1:]:
+        ema=value*k+ema*(1-k)
+    current=values[-1]
+    return {'current':current,'ema20':ema,'trend':'↑' if current>ema else ('↓' if current<ema else '→'),
+            'pctile':sum(v<current for v in values)/len(values)*100,'n':len(values),'unit':'percent',
+            'metric':'usd_spot_minus_usdt_perpetual','fx_adjusted':False,'as_of_ms':rows[-1][0]*1000}
+
 
 def spot_premium(base='BTC'):
-    """Coinbase 现货 vs Binance 合约 溢价指数
-    正 = Coinbase 高于 Binance = 美元资金/ETF 买现货 (结构性买盘)
-    负 = Binance 高于 Coinbase = 合约炒作/亚洲资金主导 (易回撤)
-    返回 {'coinbase':价, 'binance':价, 'premium':价差, 'premium_pct':%}
-    """
-    try:
-        pair = f'{base}-USD'
-        cb = json.loads(get(f'https://api.exchange.coinbase.com/products/{pair}/ticker', timeout=10))
-        cb_price = float(cb['price'])
-        bn = json.loads(get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={base}USDT', timeout=10))
-        bn_price = float(bn['price'])
-        diff = cb_price - bn_price
-        return {'coinbase':cb_price, 'binance':bn_price,
-                'premium':diff, 'premium_pct':diff/bn_price*100}
-    except Exception as e:
-        return {'err':str(e)}
+    """Unadjusted USD spot minus USDT perpetual; no inferred flow/geography."""
+    cb=float(json.loads(get('https://api.exchange.coinbase.com/products/'+urllib.parse.quote(base+'-USD',safe='')+'/ticker',timeout=10))['price'])
+    bn=float(json.loads(get('https://fapi.binance.com/fapi/v1/ticker/price?'+urllib.parse.urlencode({'symbol':base+'USDT'}),timeout=10))['price'])
+    if not all(math.isfinite(x) and x>0 for x in (cb,bn)):
+        raise ValueError('invalid premium prices')
+    return {'coinbase':cb,'binance':bn,'premium':cb-bn,'premium_pct':(cb-bn)/bn*100,
+            'metric':'usd_spot_minus_usdt_perpetual','fx_adjusted':False,'synchronous_quotes':False,
+            'unit':'USD_price_minus_USDT_price','pct_unit':'percent'}
+
 
 def bucket_step(price):
-    if price > 20000: return 500
-    if price > 5000:  return 100
-    if price > 500:   return 10
-    if price > 50:    return 1
-    if price > 1:     return 0.05
-    return 0.005
+    if price>20000:return 500
+    if price>5000:return 100
+    if price>500:return 10
+    if price>50:return 1
+    if price>1:return .05
+    return max(price*.005,1e-12)
 
-def liq_map(symbol='BTCUSDT', window_pct=0.06):
-    """读 liq_collector 累积的爆仓事件流,按价位分桶+分时间窗聚合"""
-    f = Path('/var/lib/upi-hermes/.hermes/state/liq_map')/f'{symbol}.json'
-    if not f.exists(): return None
-    try:
-        d = json.loads(f.read_text())
-        events = d.get('events',[])
-        if not events: return None
-        spot = spot_tickers((symbol,)).get(symbol,{}).get('p')
-        if not spot: return None
-        lo,hi = spot*(1-window_pct), spot*(1+window_pct)
-        now = int(time.time())
-        step = bucket_step(spot)
-        # 分时间窗聚合
-        windows = {'1h':3600,'4h':4*3600,'24h':24*3600,'72h':72*3600}
-        buckets = defaultdict(lambda: {w:{'long':0.0,'short':0.0,'n':0,'ex':set()} for w in windows})
-        for e in events:
-            if not (lo<=e['price']<=hi): continue
-            b = round(e['price']/step)*step
-            age = now - e['ts']
-            for wname,wsec in windows.items():
-                if age <= wsec:
-                    cell = buckets[b][wname]
-                    cell[e['side']] += e['qty']
-                    cell['n'] += 1
-                    cell['ex'].add(e['ex'])
-        if not buckets: return None
-        # 序列化 (set→list)
-        ser = {b:{w:{'long':v['long'],'short':v['short'],'n':v['n'],'ex':sorted(v['ex'])} for w,v in ws.items()}
-               for b,ws in sorted(buckets.items())}
-        return {'spot':spot,'buckets':ser,'age':now-d['updated'],'total_events':len(events)}
-    except Exception: return None
 
-def print_liq_map(m, symbol):
-    if not m:
-        print('## 爆仓价位分布: 暂无数据 (collector 刚启动)')
+def liq_map(symbol='BTCUSDT', window_pct=.06):
+    """Aggregate typed additive observations only; never convert old untyped events."""
+    if not re.fullmatch(r'[A-Za-z0-9_]+',symbol):
+        raise ValueError('invalid symbol')
+    root=Path(os.environ.get('LIQ_STATE_DIR',str(Path.home()/'.local/state/coinglass/liq_map')))
+    path=root/f'{symbol}.json'
+    if not path.exists():return None
+    data=json.loads(path.read_text())
+    if data.get('schema_version')!=2:
+        return {'status':'legacy_untyped','error':'Legacy quantities/times cannot safely be aggregated; preserve files separately.'}
+    events=data.get('events',[])
+    reference=spot_tickers((symbol,)).get(symbol,{}).get('p')
+    if not reference:return None
+    now_ms=int(time.time()*1000);step=bucket_step(reference)
+    windows={'1h':3600,'4h':14400,'24h':86400,'72h':259200}
+    buckets=defaultdict(lambda:{w:{'long':0.,'short':0.,'n':0,'ex':set()} for w in windows})
+    excluded=0;seen=set();accepted=0;unit=None
+    for event in events:
+        try:
+            price=float(event['price']);qty=float(event['base_qty']);stamp=float(event['exchange_ts_ms'])
+            side=event['liquidated_side'];base=event['base_asset'];eid=event['event_id']
+            valid=(valid_event(event) and event.get('symbol')==symbol and side in ('long','short')
+                   and all(math.isfinite(x) and x>0 for x in (price,qty,stamp))
+                   and event['coverage']['additive'] is True and event.get('quantity_kind')!='cumulative_filled_snapshot'
+                   and 0<=now_ms-stamp<=windows['72h']*1000 and eid not in seen and bool(base)
+                   and isinstance(base,str) and event.get('quote_asset') in ('USDT','USDC','USD')
+                   and base+event['quote_asset']==symbol and (unit is None or base==unit))
+            if not valid:excluded+=1;continue
+            seen.add(eid);unit=base
+            if not reference*(1-window_pct)<=price<=reference*(1+window_pct):continue
+            accepted+=1;bucket=round(price/step)*step
+            for name,seconds in windows.items():
+                if now_ms-stamp<=seconds*1000:
+                    cell=buckets[bucket][name];cell[side]+=qty;cell['n']+=1;cell['ex'].add(event['ex'])
+        except (KeyError,TypeError,ValueError):
+            excluded+=1
+    serialized={b:{w:{**v,'ex':sorted(v['ex'])} for w,v in ws.items()} for b,ws in sorted(buckets.items())}
+    updated=data.get('updated_ms')
+    return {'status':'ok' if accepted else 'no_data','spot':reference,'buckets':serialized,'unit':unit,
+            'age':max(0,(now_ms-updated)/1000) if isinstance(updated,(int,float)) else None,
+            'total_events':len(events),'accepted_events':accepted,'excluded_events':excluded,
+            'coverage':'typed additive observations only; sampled feeds are not a full liquidation ledger; Binance cumulative snapshots excluded',
+            'price_semantics':'exchange-specific liquidation transfer / bankruptcy prices, not necessarily executions'}
+
+
+def format_price(value):
+    if value is None:return 'N/A'
+    return f'{value:,.2f}' if abs(value)>=1 else f'{value:.10g}'
+
+
+def format_percent(value):
+    return 'N/A' if value is None else f'{value:+.4f}%'
+
+
+def print_liq_map(result, symbol):
+    if not result or not result.get('buckets'):
+        print(f'## {symbol} liquidation observations: {result.get("status","no_data") if result else "no_data"}')
         return
-    print(f'## {symbol} 爆仓价位分布 (±6%内, {m["total_events"]}笔, 数据龄{m["age"]//60}min)')
-    print(f'{"价位":>10} {"24h多爆":>10} {"24h空爆":>10} {"72h多爆":>10} {"72h空爆":>10} {"n":>4} 来源')
-    mx = max((v['72h']['long']+v['72h']['short']) for _,v in m['buckets'].items()) or 1
-    for b,ws in m['buckets'].items():
-        v24, v72 = ws['24h'], ws['72h']
-        tot72 = v72['long']+v72['short']
-        if tot72<0.001: continue
-        bar = '█'*int(tot72/mx*10)
-        marker = ' ◀现价' if abs(b-m['spot'])/m['spot']<0.005 else ''
-        ex_str = ','.join(e[:2] for e in v72['ex'])
-        print(f'{b:>10.1f} {v24["long"]:>10.2f} {v24["short"]:>10.2f} {v72["long"]:>10.2f} {v72["short"]:>10.2f} {v72["n"]:>4} {ex_str} {bar}{marker}')
+    print(f'## {symbol} sampled liquidation observations ({result["unit"]}); excluded={result["excluded_events"]}')
+    for price,windows in result['buckets'].items():
+        print(f'{format_price(price):>14} 24h long={windows["24h"]["long"]:.6g} short={windows["24h"]["short"]:.6g}')
 
-def _cg_totp(secret, t=None, step=30):
-    """CoinGlass 内部 TOTP"""
-    if t is None: t = int(time.time())
-    counter = t // step
-    key = base64.b32decode(secret)
-    msg = struct.pack('>Q', counter)
-    h = hmac.new(key, msg, hashlib.sha1).digest()
-    offset = h[-1] & 0x0f
-    return (struct.unpack('>I', h[offset:offset+4])[0] & 0x7fffffff) % 10**6
 
-def _cg_data_param():
-    """生成 CoinGlass heatmap 的加密 data 参数"""
-    t = int(time.time())
-    code = _cg_totp('I65VU7K5ZQL7WB4E', t)
-    pt = f'{t},{code}'
-    key = '1f68efd73f8d4921acc0dead41dd39bc'.encode()
-    ct = AES.new(key, AES.MODE_ECB).encrypt(pad(pt.encode(), 16))
-    return base64.b64encode(ct).decode()
-
-# CoinGlass symbol 格式映射
-CG_SYMBOL_FMT = {
-    'Binance': '{c}USDT',
-    'Bybit': '{c}USDT',
-    'OKX': '{c}-USDT-SWAP',
-    'Bitget': '{c}USDT_UMCBL',
-    'Gate': '{c}_USDT',
-}
-
-def cg_fetch(path, params):
-    """CoinGlass API 通用请求"""
-    if not CG_AVAILABLE: return None
-    params = dict(params)
-    params['data'] = _cg_data_param()
-    try:
-        d = fetch_and_decrypt(f'https://capi.coinglass.com{path}', params)
-        return d if isinstance(d,(dict,list)) else None
-    except Exception:
-        return None
-
-def coinglass_heatmap(symbol='BTC', exchange='Binance', interval='5', limit=288):
-    """CoinGlass 内部清算热图 API — 解密后返回结构化数据
-    支持多币种/多交易所/多时间窗
-    interval: 5,15,30,h2,h6,h12,h24,d1 (不同币种支持的 interval 不同)
-    """
-    fmt = CG_SYMBOL_FMT.get(exchange, '{c}USDT')
-    sym = f'{exchange}_{fmt.format(c=symbol)}'
-    d = cg_fetch('/api/index/v3/liqHeatMap',
-        {'merge':'true','symbol':sym,'interval':str(interval),'limit':str(limit)})
-    if not isinstance(d,dict) or 'liq' not in d: return None
-    y_axis = d['y']
-    liq = d['liq']
-    prices = d.get('prices',[])
-    spot = float(prices[-1][4]) if prices else 0
-    by_price = defaultdict(float)
-    for x_idx,y_idx,amt in liq:
-        if y_idx < len(y_axis):
-            by_price[y_axis[y_idx]] += float(amt)
-    return {
-        'spot':spot, 'y_axis':y_axis, 'by_price':dict(by_price),
-        'range':(d.get('rangeLow'),d.get('rangeHigh')),
-        'updateTime':d.get('updateTime'), 'instrument':d.get('instrument',{}).get('instrumentId'),
-    }
-
-def cg_home_stats():
-    """CoinGlass 全市场统计"""
-    return cg_fetch('/api/futures/home/statistics', {})
-
-def cg_oi_change_rank(limit=10):
-    """OI 变化排行 (全币种)"""
-    return cg_fetch('/api/home/oi/changeRank',
-        {'sort':'h4OiChangePercent','order':'desc','pageNum':'1','pageSize':str(limit),'ex':'all'})
-
-def cg_coin_markets(limit=20):
-    """全币种市场数据 (多空比/费率/爆仓/OI)"""
-    return cg_fetch('/api/home/v2/coinMarkets',
-        {'sort':'h4PriceChangePercent','order':'desc','pageNum':'1','pageSize':str(limit),'ex':'all'})
-
-def cg_funding_chart(symbol='BTC'):
-    """全所费率对比"""
-    return cg_fetch('/api/fundingRate/chart', {'symbol':symbol})
-
-def cg_liquidation_chart(symbol='BTC'):
-    """180天爆仓历史 (按交易所)"""
-    return cg_fetch('/api/futures/liquidation/chart', {'symbol':symbol})
-
-def cg_liquidation_info():
-    """各所爆仓统计"""
-    return cg_fetch('/api/futures/liquidation/info', {})
-
-def cg_etf_flow():
-    """ETF 资金流历史"""
-    return cg_fetch('/api/etf/flow', {})
-
-def cg_ahr999():
-    """AHR999 指数 (5711天历史)"""
-    return cg_fetch('/api/index/ahr999', {})
-
-def cg_fear_greed():
-    """恐惧贪婪指数"""
-    return cg_fetch('/api/index/fearGreed', {})
-
-def print_cg_heatmap(h, symbol):
-    if not h or 'err' in h:
-        print(f'## CoinGlass 清算热图: {h.get("err","暂无数据") if h else "未启用"}')
+def print_cg_heatmap(result, symbol):
+    if not result or result.get('status') in ('error','no_data') or 'err' in result:
+        print(f'## CoinGlass {symbol}: no usable heatmap')
         return
-    spot = h['spot']
-    by_price = h['by_price']
-    # 上下分离
-    above = sorted([(p,a) for p,a in by_price.items() if p>spot], key=lambda x:-x[1])
-    below = sorted([(p,a) for p,a in by_price.items() if p<=spot], key=lambda x:-x[1])
-    mx = max(by_price.values()) if by_price else 1
-    print(f'## CoinGlass {symbol} 清算热图 (现价${spot:,.0f}, {len(by_price)}价位)')
-    print(f'{"价位":>10} {"强度":>14} {"":>3} 位置')
-    for p,a in above[:8]:
-        bar = '█'*int(a/mx*12)
-        print(f'  ${p:>9,.0f} {a:>14,.0f} {bar:<12} ↑阻力')
-    print(f'  {"─"*40}')
-    for p,a in below[:8]:
-        bar = '█'*int(a/mx*12)
-        marker = ' ◀现价' if abs(p-spot)/spot<0.005 else ''
-        print(f'  ${p:>9,.0f} {a:>14,.0f} {bar:<12} ↓支撑{marker}')
-    print()
+    reference=result.get('reference_contract_price',result.get('spot'))
+    profile=result.get('by_price',{});maximum=max(profile.values(),default=0) or 1
+    print(f'## CoinGlass {symbol}: contract candle close {format_price(reference)}, latest-slice intensity (unit unverified)')
+    for price,intensity in sorted(profile.items(),key=lambda x:-x[1])[:16]:
+        if math.isfinite(intensity) and intensity>=0:
+            print(f'  {format_price(price):>14} {intensity:>14,.2f} {"█"*int(intensity/maximum*12)}')
 
-# ============ 输出 ============
-def fmt_b(n): return f'${n:.1f}B' if n else '-'
 
-def collect(base='BTC'):
-    """聚合全部数据为 dict — 供 --json 和其它脚本复用"""
-    out = {'base':base,'ts':datetime.now(timezone.utc).isoformat()}
-    out['spot'] = spot_tickers([f'{base}USDT','ETHUSDT'])
-    if CY: out['sentiment'] = scan_sentiment(base)
-    out['vpvr'] = vpvr(f'{base}USDT')
-    out['liq_map'] = liq_map(f'{base}USDT')
-    out['premium'] = spot_premium(base)
-    out['premium_trend'] = premium_trend(base)
-    out['cg_heatmap'] = coinglass_heatmap(base)
-    if base=='BTC':
-        out['deribit'] = deribit_walls()
-        out['etf'] = etf_flow()
-    out['stablecoin'] = stablecoin()
+def _spot_status(data):
+    if not data:
+        return 'no_data'
+    usable = 0
+    errors = 0
+    no_data = 0
+    for row in data.values():
+        if isinstance(row, dict) and row.get('status') == 'error':
+            errors += 1
+        elif isinstance(row, dict) and row.get('status') == 'no_data':
+            no_data += 1
+        elif isinstance(row, dict) and row.get('p') is not None:
+            usable += 1
+        else:
+            no_data += 1
+    if usable and not errors and not no_data:
+        return 'ok'
+    if usable:
+        return 'partial'
+    if errors:
+        return 'error'
+    return 'no_data'
+
+
+def _sentiment_status(data):
+    if not data:
+        return 'no_data'
+    usable = 0
+    errors = 0
+    no_data = 0
+    fields = ('oi_chg', 'long_liq', 'short_liq', 'ls', 'fr')
+    for row in data:
+        if isinstance(row, dict) and row.get('status') == 'error':
+            errors += 1
+        elif isinstance(row, dict) and row.get('status') == 'no_data':
+            no_data += 1
+        elif isinstance(row, dict) and any(row.get(key) is not None for key in fields):
+            usable += 1
+        else:
+            no_data += 1
+    if usable and not errors and not no_data:
+        return 'ok'
+    if usable:
+        return 'partial'
+    if errors:
+        return 'error'
+    return 'no_data'
+
+
+def _aggregate_source_status(name, data):
+    if isinstance(data, dict) and data.get('status') in ('ok', 'partial', 'error', 'legacy_untyped', 'no_data', 'not_configured'):
+        return data['status']
+    if name == 'spot' and isinstance(data, dict):
+        return _spot_status(data)
+    if name == 'sentiment' and isinstance(data, list):
+        return _sentiment_status(data)
+    return 'no_data' if data is None or data == [] or data == {} else 'ok'
+
+
+def _source(call, name=None):
+    stamp=datetime.now(timezone.utc).isoformat()
+    try:
+        data=call()
+        return {'status':_aggregate_source_status(name, data),'data':data,'as_of':stamp}
+    except Exception as exc:
+        # Exception messages may embed signed query strings: return typed safe diagnostics.
+        error={'type':type(exc).__name__}
+        for key in ('category','code'):
+            if hasattr(exc,key):error[key]=getattr(exc,key)
+        return {'status':'error','error':error,'as_of':stamp}
+
+
+SOURCE_NAMES=('spot','sentiment','vpvr','liq_map','premium','premium_trend','cg_heatmap','deribit','etf','stablecoin')
+
+
+def collect(base='BTC', sources=None, heatmap_options=None):
+    base=base.upper()
+    if not re.fullmatch(r'[A-Z0-9]+',base):raise ValueError('invalid base asset')
+    selected=list(sources) if sources is not None else list(SOURCE_NAMES)
+    if any(name not in SOURCE_NAMES for name in selected):raise ValueError('unknown source')
+    calls={'spot':lambda:spot_tickers((base+'USDT','ETHUSDT')),
+           'sentiment':lambda:scan_sentiment(base),'vpvr':lambda:vpvr(base+'USDT'),
+           'liq_map':lambda:liq_map(base+'USDT'),'premium':lambda:spot_premium(base),
+           'premium_trend':lambda:premium_trend(base),
+           'cg_heatmap':lambda:coinglass_heatmap(base,**(heatmap_options or {})),
+           'deribit':lambda:deribit_walls(currency=base) if base in ('BTC','ETH') else None,
+           'etf':lambda:etf_flow() if base=='BTC' else None,'stablecoin':stablecoin}
+    out={'schema_version':2,'base':base,'ts':datetime.now(timezone.utc).isoformat()}
+    for name in selected:
+        if name=='sentiment' and not CY and not os.environ.get('MARKET_API_KEY_FILE'):
+            out[name]={'status':'not_configured','data':None,'as_of':out['ts']}
+        else:
+            out[name]=_source(calls[name], name)
     return out
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('-')]
-    base = args[0].upper().replace('USDT','') if args else 'BTC'
-    json_mode = '--json' in sys.argv
 
-    if json_mode:
-        print(json.dumps(collect(base), ensure_ascii=False, default=str))
-        return
-
-    print(f'# market_scan {base}/USDT — {datetime.now(timezone.utc).strftime("%m-%d %H:%M UTC")}\n')
-
-    # 现货
-    s = spot_tickers([f'{base}USDT','ETHUSDT'])
-    for k,v in s.items():
-        print(f'{k:<10} ${v["p"]:>11,.2f}  24h {v["chg"]:+.2f}%')
-    print()
-
-    # 情绪
-    if CY:
-        print('## 四所合约情绪 (24h)')
-        print(f'{"所":<10}{"OIΔ":>8}{"多爆":>8}{"空爆":>8}{"账户多/空":>12}{"费率":>9}')
-        rows = scan_sentiment(base)
-        tl=ts=0
-        for r in rows:
-            if 'err' in r: print(f'{r["ex"]:<10}ERR'); continue
-            ls = f'{r["ls"][0]:.0f}/{r["ls"][1]:.0f}' if r['ls'] else '-'
-            print(f'{r["ex"]:<10}{r["oi_chg"] or 0:>+7.2f}%{r["long_liq"]:>7.1f}{r["short_liq"]:>7.1f}{ls:>12}{(r["fr"] or 0):>+8.4f}%')
-            tl+=r['long_liq']; ts+=r['short_liq']
-        print(f'合计: 多爆{tl:.0f} 空爆{ts:.0f} (空/多 {ts/max(tl,1):.1f}x)\n')
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('base',nargs='?',default='BTC')
+    parser.add_argument('--json',action='store_true')
+    parser.add_argument('--etf',action='store_true',help='Farside BTC ETF only, values are USD millions')
+    parser.add_argument('--source',action='append',choices=SOURCE_NAMES)
+    parser.add_argument('--model',choices=('1','2','3','legacy'),default='1')
+    parser.add_argument('--scope',choices=('pair','aggregate'),default='pair')
+    parser.add_argument('--window')
+    parser.add_argument('--exchange',default='Binance')
+    parser.add_argument('--quote',default='USDT')
+    parser.add_argument('--original-symbol')
+    parser.add_argument('--interval')
+    parser.add_argument('--limit',type=int)
+    args=parser.parse_args(argv)
+    if args.etf and args.source:parser.error('--etf cannot be combined with --source')
+    if args.window and (args.interval is not None or args.limit is not None):parser.error('--window conflicts with --interval/--limit')
+    base=args.base.upper()
+    if base.endswith('USDT'):base=base[:-4]
+    options={'model':args.model if args.model=='legacy' else int(args.model),'scope':args.scope,'exchange':args.exchange,'quote':args.quote}
+    for key in ('window','original_symbol','interval','limit'):
+        value=getattr(args,key)
+        if value is not None:options[key]=value
+    out=collect('BTC' if args.etf else base,sources=['etf'] if args.etf else args.source,heatmap_options=options)
+    if args.json:
+        print(json.dumps(out,ensure_ascii=False,default=str,allow_nan=False))
     else:
-        print('(Coinalyze key 缺失, 跳过情绪表)\n')
+        print(f'# {out["base"]} market scan — {out["ts"]}')
+        for name in (n for n in out if n in SOURCE_NAMES):
+            item=out[name];data=item.get('data')
+            if item['status']!='ok' and not (item['status']=='partial' and name in ('spot','sentiment')):
+                print(f'## {name}: {item["status"]} {item.get("error",{})}');continue
+            if name=='cg_heatmap':print_cg_heatmap(data,base)
+            elif name=='liq_map':print_liq_map(data,base+'USDT')
+            elif name=='sentiment':
+                print(f'## selected perpetual sentiment ({item["status"]}); liquidation unit USD')
+                for row in data:
+                    if row.get('status') == 'error':
+                        print(f'{row.get("ex","unknown")}: error {row.get("error_type","Error")}')
+                    elif row.get('status') == 'no_data':
+                        print(f'{row.get("ex","unknown")}: no_data')
+                    else:
+                        print(f'{row.get("ex","unknown")}: OI {format_percent(row.get("oi_chg"))}, funding {format_percent(row.get("fr"))}, long {row.get("long_liq")}, short {row.get("short_liq")}')
+            elif name=='spot':
+                print(f'## spot ({item["status"]})\n'+json.dumps(data,ensure_ascii=False,default=str))
+            else:print(f'## {name}\n'+json.dumps(data,ensure_ascii=False,default=str))
+    return 1 if any(out[n]['status'] in ('error','partial') for n in out if n in SOURCE_NAMES) else 0
 
-    # Deribit 墙 (只 BTC)
-    if base=='BTC':
-        w = deribit_walls()
-        if w:
-            print(f'## Deribit {w["expiry"]} 期权墙 (spot est {w["spot"]:,.0f}, total OI {w["total_oi"]:,.0f} BTC, max pain {w["max_pain"]:,.0f})')
-            spot_p = w['spot']
-            # 显示 spot 上下最近的墙
-            strikes = sorted(w['strikes'].items())
-            show = [x for x in strikes if abs(x[0]-spot_p)/spot_p < 0.12]
-            show.sort(key=lambda x: -(x[1]['call']+x[1]['put']))
-            for s,v in show[:8]:
-                net = v['call']-v['put']
-                side = 'call' if net>0 else 'put'
-                print(f'  {s:>9,.0f}  call{v["call"]:>7,.0f} put{v["put"]:>6,.0f} net{net:>+7,.0f} ({side})')
-            print()
-
-    # VPVR 成交密集区
-    v = vpvr(f'{base}USDT')
-    if v:
-        print(f'## 30d 成交密集区 (VPVR, POC={v["poc"]:,.0f}, 现价{v["price"]:,.0f})')
-        for line in render_vpvr(v):
-            print(line)
-        print()
-
-    # 现货溢价 (Coinbase vs Binance)
-    p = spot_premium(base)
-    pt = premium_trend(base)
-    if p and 'err' not in p:
-        sig = '美元资金买现货(结构性买盘)' if p['premium']>0 else '合约主导(亚洲资金)'
-        print(f'## 现货溢价 Coinbase-Binance: {p["premium"]:+.1f} ({p["premium_pct"]:+.3f}%) {sig}')
-        print(f'  CB ${p["coinbase"]:,.0f} / BN ${p["binance"]:,.0f}')
-        if pt and 'err' not in pt:
-            print(f'  24h: 当前{pt["current"]:+.3f}% vs EMA20 {pt["ema20"]:+.3f}% {pt["trend"]} (分位{pt["pctile"]:.0f}%)')
-        print()
-    elif p and 'err' in p:
-        print(f'## 现货溢价: ERR {p["err"]}\n')
-
-    # 爆仓价位分布
-    print_liq_map(liq_map(f'{base}USDT'), f'{base}USDT')
-    print()
-
-    # CoinGlass 清算热图
-    print_cg_heatmap(coinglass_heatmap(base), base)
-
-    # 稳定币
-    st = stablecoin()
-    if st:
-        print(f'## 稳定币总供应 {fmt_b(st["total_b"])}  7日 {st["delta_7d_b"]:+.2f}B')
-    print()
-
-    # ETF (只 BTC)
-    if base=='BTC':
-        ef = etf_flow()
-        if ef:
-            print('## BTC ETF 净流入 USD mn (Farside, Total列)')
-            for row in ef[-6:]:
-                # row[0]=日期, row[-1]=Total
-                print(f'  {row[0]:<14} {row[-1]:>10}')
-        else:
-            print('## ETF: 拉取失败 (Farside 反爬)')
 
 if __name__=='__main__':
-    main()
+    raise SystemExit(main())

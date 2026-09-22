@@ -1,135 +1,112 @@
 # CoinGlass Reverse Engineering Toolkit
 
-Free access to CoinGlass liquidation heatmap data via internal API reverse engineering.
+Read-only adapters for selected CoinGlass web data, plus a multi-source market scanner and optional liquidation/premium collectors. Internal website APIs are **undocumented, versioned and permission/rate-limit dependent**. This is not a complete CoinGlass SDK, an official API equivalent, or a trading signal service.
 
-## Features
+## Install and test
 
-- **Multi-coin**: BTC, ETH, SOL, HYPE, DOGE, XRP, BNB, WIF, LTC, ADA, NEAR, ENA, LINK (19+ coins)
-- **Multi-exchange**: Binance, Bybit, OKX, Bitget, Gate (5 exchanges)
-- **Multi-timeframe**: 5m, 15m, 30m, 2h, 6h, 12h, 24h, 1d (8 intervals)
-- **Structured data**: Raw `[x_idx, y_idx, amount_usd]` + `y_axis` + `prices` — same as official API
-- **Zero cost**: No API key, no subscription, no browser required
-
-## Architecture
-
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  CoinGlass Web  │────▶│  capi.coinglass  │────▶│  AES-128-ECB   │
-│  (React SPA)    │     │  /api/index/v3   │     │  + gzip + TOTP │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-         │                                               │
-         │                                               ▼
-         │                                        ┌─────────────────┐
-         │                                        │  coinglass-     │
-         │                                        │  decrypt.py     │
-         │                                        │  (this repo)    │
-         │                                        └─────────────────┘
-         │                                               │
-         ▼                                               ▼
-┌─────────────────┐                            ┌─────────────────┐
-│  Canvas/ECharts │                            │  Structured JSON│
-│  (rendering)    │                            │  {liq, y, prices}│
-└─────────────────┘                            └─────────────────┘
-```
-
-## Quick Start
+Python 3.11+:
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt pytest
+.venv/bin/python -m pytest -q
 ```
+
+Tests are offline and use synthetic fixtures. Public live checks are opt-in; no account keys are needed for the tested anonymous CoinGlass paths. A ticker search result does not guarantee heatmap access. Login/Prime gates must not be treated as unsupported symbols or bypassed.
+
+## Heatmap quick start
 
 ```python
-from coinglass_decrypt import fetch_and_decrypt
 from market_scan import coinglass_heatmap
+from coinglass_decrypt import CoinGlassError
 
-# Get BTC liquidation heatmap (Binance, 5min interval)
-h = coinglass_heatmap('BTC', 'Binance', '5', 288)
-print(f"Spot: ${h['spot']:,.0f}")
-print(f"Top support: {h['top_below'][:3]}")
-print(f"Top resistance: {h['top_above'][:3]}")
+try:
+    h = coinglass_heatmap(
+        "BTC", "Binance", model=1, scope="pair", window="24h",
+        original_symbol="BTCUSDT",  # exact exchange instrument, not a guessed suffix
+    )
+    print("Contract candle close:", h["reference_contract_price"])
+    print("Latest-slice price clusters:", h["top_below"][:3], h["top_above"][:3])
+    print("Raw cells:", len(h["raw"]["liq"]))
+    print("Provenance:", h["metadata"])
+except CoinGlassError as exc:
+    print("Data unavailable:", exc.category, exc.code)
 ```
 
-## Data Structure
+Omit `original_symbol` to resolve the exchange/quote instrument from CoinGlass's public ticker metadata. When several instruments share the same exchange/base/quote (perpetual plus dated deliveries), the client prefers the conventional `{symbol}{quote}` ticker (e.g. `BTCUSDT`, matching live pair smoke) or a unique `type==1` perpetual. Truly unknown or still-ambiguous matches fail closed; no fallback manufactures a fake `COINUSDT`. Models 1/2/3 and pair/aggregate scopes use separate endpoints. Legacy v3 is an explicit compatibility mode, not a numbered current model.
 
-```json
-{
-  "instrument": {"instrumentId": "BTCUSDT", "exName": "Binance"},
-  "liq": [[0, 1, 1666629.61], ...],  // [x_idx, y_idx, amount_usd]
-  "y": [77507.89, 77586.88, ...],     // price axis
-  "prices": [[1789917300, "80720.3", "80855.5", "80720.2", "80795.2", "35855198.1842"], ...],
-  "rangeHigh": 95596.5,
-  "rangeLow": 71899.6
-}
+- `by_price` and `top_above/top_below` use **only the final time slice**, not sums of historical snapshots.
+- `raw` preserves the original axes, candles, cells and instrument metadata.
+- `spot` is only a deprecated alias for the selected contract's final candle close. It is **not a separately fetched spot/index/mark price**.
+- Heatmap values are **estimated liquidation intensity with an unverified unit**, not observed liquidation executions or guaranteed USD notional. Price clusters are not proven support/resistance.
+- `window` cannot be combined with explicit `interval`/`limit`. Positional `(symbol, exchange, interval, limit)` remains available for granular requests; no silent model fallback.
+
+### Website window presets
+
+| Window | Model 1/2 interval | limit | Model 3 range |
+|---|---|---:|---|
+| 12h | 5 | 144 | 12h |
+| 24h | 5 | 288 | 24h |
+| 48h | 15 | 192 | 48h |
+| 3d | 15 | 288 | 72h |
+| 1w | 30 | 336 | 7d |
+| 2w | 30 | 672 | 14d |
+| 1mo | h2 | 372 | 30d |
+| 3mo | h6 | 360 | 90d |
+| 6mo | h12 | 360 | 180d |
+| 1y | h24 | 360 | 365d |
+| 2y | d1 | 720 | 720d |
+
+Presets reproduce website requests, not exact calendar periods or guaranteed access. Model 3 uses `range` and `cp=false`, not interval/limit. Color palettes, liquidity threshold and chart style are display-only controls, not invented API parameters.
+
+## Scanner CLI
+
+```bash
+python market_scan.py BTC --json
+python market_scan.py --etf --json
+python market_scan.py BTC --source cg_heatmap --model 2 --window 48h --json
+python market_scan.py BTC --source cg_heatmap --model 3 --scope aggregate --window 3d
+python market_scan.py ETH --source premium --source deribit
 ```
 
-## Capability Matrix
+JSON reports have `schema_version=2`; each source has `status`, `data` or a typed `error`, and `as_of`. A failing source does not erase the other sources. `as_of` records the observation attempt, not necessarily the upstream data update time. Missing data is not zero. For row-shaped sources, `spot` and `sentiment` use source-specific aggregation: `ok` means all requested rows were usable, `partial` means usable rows were mixed with failed/no-data rows, `error` means no usable rows and at least one upstream error, and `no_data` means empty/all no-data. `not_configured` remains an optional skip for sources needing local configuration. Nonzero CLI exit status indicates one or more `error` or `partial` sources, while JSON remains readable.
 
-| Coin | Binance | Bybit | OKX | Bitget | Gate |
-|------|---------|-------|-----|--------|------|
-| BTC  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| ETH  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| SOL  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| UNI  | ⚠️      | ⚠️    | ⚠️  | ⚠️     | ⚠️   |
-| ZEC  | ⚠️      | ⚠️    | ⚠️  | ⚠️     | ⚠️   |
-| TAO  | ⚠️      | ⚠️    | ⚠️  | ⚠️     | ⚠️   |
-| SUI  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| HYPE | ✅      | ✅    | ✅  | ✅     | ✅   |
-| DOGE | ✅      | ✅    | ✅  | ✅     | ✅   |
-| XRP  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| BNB  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| ARB  | ⚠️      | ⚠️    | ⚠️  | ⚠️     | ⚠️   |
-| WIF  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| LTC  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| ADA  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| NEAR | ✅      | ✅    | ✅  | ✅     | ✅   |
-| ENA  | ✅      | ✅    | ✅  | ✅     | ✅   |
-| LINK | ✅      | ✅    | ✅  | ✅     | ✅   |
+`--etf` selects only the **Farside BTC ETF HTML table (USD millions)**. This is distinct from `cg_etf_flow`, whose raw `changeUsd` is already USD. Other source names are listed in `--help`.
 
-⚠️ = intermittent (some intervals may return empty)
+Coinalyze is optional: set `COINALYZE_KEY` or an explicitly chosen `MARKET_API_KEY_FILE`. Nothing automatically reads a particular user's secret directory. Liquidation/open-interest histories request USD conversion; unavailable quantities remain unknown.
 
-| Interval | Stability | Notes |
-|----------|-----------|-------|
-| `5` (5min) | ⚠️ | BTC stable, others intermittent |
-| `15` (15min) | ⚠️ | BTC stable, others intermittent |
-| `30` (30min) | ⚠️ | BTC only |
-| `h2` (2h) | ⚠️ | BTC only |
-| `h6` (6h) | ✅ | Most coins stable |
-| `h12` (12h) | ✅ | Most coins stable |
-| `h24` (24h) | ✅ | Most coins stable |
-| `d1` (1d) | ✅ | Most coins stable |
+## Units and scope
 
-## Authentication
+- **ETF:** CoinGlass `changeUsd` is USD; `change` is asset quantity. `617600000` → `617.60M` is formatting only. Missing issuer fields are not confirmed zero. BTC and ETH use different endpoints.
+- **Funding:** a raw value of `0.01` means `0.01%`. Linear annualization needs the actual settlement interval; sampling `m5` is not a five-minute funding settlement. It is not realized/compound yield.
+- **Open interest:** `currency=USD/BTC` requests denomination, not collateral type. Do not convert a historical series with today's price or assume a single chart price reconstructs all venue values exactly.
+- **Long/short:** taker volume, account shares and position ratios are distinct, not counts of people.
+- **Options:** Deribit output is OI distribution, not gamma exposure/dealer positioning. `deribit_walls(expiry_policy="max_oi")` honestly selects maximum OI; `nearest` and an explicit `expiry` are alternatives.
+- **Premium:** Coinbase USD spot minus Binance USDT perpetual is an **unadjusted cross-market, cross-quote difference**, not identified ETF/geographic buying. Existing stored values retain that definition.
+- **Time:** heatmap candle times are seconds, update times may be milliseconds; Fear & Greed uses milliseconds, AHR dates are strings. Do not globally multiply every timestamp by 1000.
+- **VPVR:** uniform allocation across hourly OHLC ranges is an approximation, not executed volume-at-price.
 
-CoinGlass uses **TOTP + AES-128-ECB** for request signing:
+See [migration and event contracts](docs/migration.md) and [audit remediation](docs/audit-remediation.md). Named helpers cover selected verified routes only. All 413 discovered site routes are **not** implemented or behaviorally verified.
 
-1. Generate TOTP code (secret: `I65VU7K5ZQL7WB4E`, step: 30s)
-2. Plaintext: `{unix_timestamp},{totp_code}`
-3. AES-128-ECB encrypt with key `1f68efd73f8d4921acc0dead41dd39bc`
-4. Base64 encode → `data` parameter
+## Optional collectors
 
-Response uses **AES-128-ECB + gzip** for encryption:
-1. `Base64(path)[:16]` → first layer key
-2. Decrypt `user` header → gunzip → real AES key
-3. Decrypt `data` → gunzip → JSON
+Collectors are never started on import or installation:
 
-## Files
+```bash
+LIQ_STATE_DIR=/path/to/new-liq-state python liq_collector.py
+PREMIUM_STATE_DIR=/path/to/premium-state python premium_collector.py
+```
 
-| File | Purpose |
-|------|---------|
-| `coinglass_decrypt.py` | Core decryption (AES+TOTP+gzip) |
-| `market_scan.py` | Full market data aggregator (10 blocks) |
-| `liq_collector.py` | Real-time liquidation stream collector |
-| `premium_collector.py` | Spot-future premium collector |
-| `requirements.txt` | Dependencies |
+Default locations are under `~/.local/state/coinglass/`. Set paths explicitly when migrating a deployment. No automatic service installation or production migration is included.
 
-## Limitations
+Liquidation schema v2 stores raw units, normalized base quantity, exchange/receive times, position direction and price/quantity semantics. **Legacy mixed-unit files must not be silently converted.** Binance cumulative filled snapshots without reliable order identity are retained as non-additive observations and excluded from economic totals; sampled feeds cannot prove a complete liquidation ledger. OKX quantities require instrument metadata; unknown contracts fail closed. See the migration guide before pointing a new collector at an existing directory.
 
-- `data` parameter expires every 30s (TOTP-based)
-- Some coins have intermittent coverage (UNI/ZEC/TAO)
-- No official documentation — parameters may change
-- Rate limits unknown (use responsibly)
+The liquidation collector also writes operational health to `LIQ_STATE_DIR/_health/status.json` using atomic replace. This file is intentionally outside the root symbol-file glob. It reports each source's connected/ACK/error state, last accepted event time when one has actually arrived, pending buffer count, accepted record count, flush errors and last flush/persist timestamps. A quiet but connected feed is different from a failed ACK or dead source; no synthetic liquidation events are created to prove liveness.
 
-## Related
+## Protocol and verification boundaries
 
-- [xeronsh/coinglass-decrypt](https://github.com/xeronsh/coinglass-decrypt) — Original decryption research
-- [CoinGlass API Docs](https://docs.coinglass.com) — Official paid API reference
+Request signing uses a six-digit TOTP string and **AES-256-ECB** (32 UTF-8 key bytes). Response decryption is a separate version-specific AES/gzip process. Business errors, malformed encryption headers and schema failures are not successful market data. Signing constants reproduced from public client code are protocol details, not account credentials.
+
+Offline tests prove the local behavior for specified fixtures, not endpoint availability. Live source access, subscription gates, historical coverage and rates can change. Respect upstream terms and rate limits. No login or payment credentials are included.
+
+Original decryption research: [xeronsh/coinglass-decrypt](https://github.com/xeronsh/coinglass-decrypt). Official reference: [CoinGlass API documentation](https://docs.coinglass.com).

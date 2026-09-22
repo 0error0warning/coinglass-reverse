@@ -1,58 +1,86 @@
 #!/usr/bin/env python3
-"""premium_collector.py — Coinbase/Binance 现货溢价常驻收集
+"""Unadjusted Coinbase USD spot minus Binance USDT perpetual price history.
 
-每分钟拉一次两所价格,计算溢价存 SQLite. 供 market_scan.py 读取做趋势分析.
-
-数据表: premium(symbol, ts, coinbase, binance, diff, pct)
+Not a same-currency spot premium or identified institutional/geographic flow.
+Prices are sampled sequentially. No directories, files or network at import.
 """
-import json, sqlite3, time, logging
-from pathlib import Path
+import json
+import logging
+import math
+import os
+import sqlite3
+import signal
+import threading
+import time
 import urllib.request
+from pathlib import Path
 
-STATE_DIR = Path('/var/lib/upi-hermes/.hermes/state/premium')
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-DB = STATE_DIR/'premium.db'
-LOG = STATE_DIR/'collector.log'
+STATE_DIR=Path(os.environ.get('PREMIUM_STATE_DIR',str(Path.home()/'.local/state/coinglass/premium')))
+DB=STATE_DIR/'premium.db'
+log=logging.getLogger('premium')
+SYMBOLS=[('BTC','BTC-USD','BTCUSDT'),('ETH','ETH-USD','ETHUSDT'),('SOL','SOL-USD','SOLUSDT')]
+INTERVAL=60
+KEEP_DAYS=30
 
-from logging.handlers import RotatingFileHandler
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s',
-    handlers=[RotatingFileHandler(LOG, maxBytes=500_000, backupCount=1), logging.StreamHandler()])
-log = logging.getLogger('premium')
-
-SYMBOLS = [('BTC','BTC-USD','BTCUSDT'), ('ETH','ETH-USD','ETHUSDT'), ('SOL','SOL-USD','SOLUSDT')]
-INTERVAL = 60  # 秒
-KEEP_DAYS = 30  # 保留30天
 
 def get(url):
-    req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0'})
-    return urllib.request.urlopen(req, timeout=10).read()
+    req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
+    with urllib.request.urlopen(req,timeout=10) as response:
+        return response.read()
+
+
+def prune(conn):
+    conn.execute('DELETE FROM premium WHERE ts < ?',(int(time.time())-KEEP_DAYS*86400,))
+
 
 def init_db():
-    conn = sqlite3.connect(DB)
-    conn.execute('''CREATE TABLE IF NOT EXISTS premium
-        (sym TEXT, ts INTEGER, coinbase REAL, binance REAL, diff REAL, pct REAL,
-         PRIMARY KEY(sym, ts))''')
-    conn.execute(f'DELETE FROM premium WHERE ts < {int(time.time())-KEEP_DAYS*86400}')
-    conn.commit()
+    DB.parent.mkdir(parents=True,exist_ok=True)
+    conn=sqlite3.connect(DB)
+    with conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS premium (sym TEXT, ts INTEGER, coinbase REAL, binance REAL, diff REAL, pct REAL, PRIMARY KEY(sym, ts))')
+        prune(conn)
     return conn
 
+
 def collect_once(conn):
-    for sym, cb_pair, bn_sym in SYMBOLS:
+    statuses=[]
+    for sym,cb_pair,bn_sym in SYMBOLS:
         try:
-            cb = json.loads(get(f'https://api.exchange.coinbase.com/products/{cb_pair}/ticker'))
-            cb_p = float(cb['price'])
-            bn = json.loads(get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={bn_sym}'))
-            bn_p = float(bn['price'])
-            diff = cb_p - bn_p
-            conn.execute('INSERT OR REPLACE INTO premium VALUES (?,?,?,?,?,?)',
-                (sym, int(time.time()), cb_p, bn_p, diff, diff/bn_p*100))
-            conn.commit()
-        except Exception as e:
-            log.error(f'{sym}: {e}')
+            cb=float(json.loads(get(f'https://api.exchange.coinbase.com/products/{cb_pair}/ticker'))['price'])
+            bn=float(json.loads(get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={bn_sym}'))['price'])
+            if not all(math.isfinite(p) and p>0 for p in (cb,bn)):
+                raise ValueError('prices must be positive finite numbers')
+            with conn:
+                conn.execute('INSERT OR REPLACE INTO premium (sym,ts,coinbase,binance,diff,pct) VALUES (?,?,?,?,?,?)',
+                             (sym,int(time.time()),cb,bn,cb-bn,(cb-bn)/bn*100))
+            statuses.append({'symbol':sym,'status':'ok'})
+        except Exception as exc:
+            log.warning('%s collection failed (%s)',sym,type(exc).__name__)
+            statuses.append({'symbol':sym,'status':'error','error_type':type(exc).__name__})
+    # Run even with no symbols or all upstream requests failing.
+    with conn:
+        prune(conn)
+    return statuses
+
+
+def main(stop_event=None):
+    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
+    owned_stop = stop_event is None
+    if owned_stop:
+        stop_event = threading.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *a: stop_event.set())
+    conn=init_db()
+    try:
+        while not stop_event.is_set():
+            try:collect_once(conn)
+            except Exception as exc:log.error('collection/retention failed (%s)',type(exc).__name__)
+            if stop_event.wait(INTERVAL):break
+    except KeyboardInterrupt:
+        if owned_stop: stop_event.set()
+        pass
+    finally:conn.close()
+
 
 if __name__=='__main__':
-    log.info('premium_collector start')
-    conn = init_db()
-    while True:
-        collect_once(conn)
-        time.sleep(INTERVAL)
+    main()

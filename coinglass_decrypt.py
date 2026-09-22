@@ -76,6 +76,25 @@ def _derive_key0(
     return base64.b64encode(constant.encode()).decode()[:16]
 
 
+class CoinGlassError(ValueError):
+    """Safe boundary error. Never include request URLs or signed parameters."""
+
+    def __init__(self, category, code, message):
+        self.category = category
+        self.code = code
+        super().__init__(f'{category}: {message}')
+
+
+def check_business(value):
+    if isinstance(value, dict):
+        code = value.get('code')
+        if value.get('success') is False or (code is not None and str(code) not in ('0', '200')):
+            category = {'40000': 'authentication', '40003': 'permission', '50001': 'rate_limit'}.get(str(code), 'business')
+            safe_code = code if isinstance(code, (int, str)) and str(code).isdigit() else 'business_error'
+            raise CoinGlassError(category, safe_code, 'API rejected the request')
+    return value
+
+
 def decrypt(
     encrypted_body: str,
     user_token_b64: str,
@@ -84,7 +103,7 @@ def decrypt(
     *,
     cache_ts: str = "",
     time_header: str = "",
-) -> Dict[str, Any]:
+) -> Any:
     """
     Decrypt a CoinGlass encrypted API response.
 
@@ -99,24 +118,25 @@ def decrypt(
     Returns:
         Decrypted JSON as Python dict.
     """
-    outer = json.loads(encrypted_body)
-    payload = base64.b64decode(outer["data"])
-    token = base64.b64decode(user_token_b64)
+    try:
+        outer = check_business(json.loads(encrypted_body))
+        payload = base64.b64decode(outer["data"], validate=True)
+        token = base64.b64decode(user_token_b64, validate=True)
+        key0 = _derive_key0(str(v), url, cache_ts=cache_ts, time_header=time_header)
+        step1 = unpad(AES.new(key0.encode(), AES.MODE_ECB).decrypt(token), 16)
+        actual_key = gzip.decompress(step1).decode()
+        step2 = unpad(AES.new(actual_key.encode(), AES.MODE_ECB).decrypt(payload), 16)
+        result = check_business(json.loads(gzip.decompress(step2).decode()))
+        if not isinstance(result, (dict, list)):
+            raise CoinGlassError('schema', 'invalid_payload', 'Expected object or array')
+        return result
+    except CoinGlassError:
+        raise
+    except Exception:
+        raise CoinGlassError('decrypt', 'invalid_ciphertext', 'Response decryption failed') from None
 
-    key0 = _derive_key0(v, url, cache_ts=cache_ts, time_header=time_header)
 
-    # Layer 1-2: decrypt user token → gunzip → actual key
-    step1 = unpad(AES.new(key0.encode(), AES.MODE_ECB).decrypt(token), 16)
-    actual_key = gzip.decompress(step1).decode()
-
-    # Layer 3-4: decrypt payload → gunzip → JSON
-    step2 = unpad(AES.new(actual_key.encode(), AES.MODE_ECB).decrypt(payload), 16)
-    plain = gzip.decompress(step2).decode()
-
-    return json.loads(plain)
-
-
-def fetch_and_decrypt(url: str, params: dict = None, timeout: int = 30) -> Dict[str, Any]:
+def fetch_and_decrypt(url: str, params: dict = None, timeout: int = 30) -> Any:
     """Fetch an encrypted CoinGlass API endpoint and return the decrypted data.
 
     Args:
@@ -134,40 +154,32 @@ def fetch_and_decrypt(url: str, params: dict = None, timeout: int = 30) -> Dict[
     import requests
 
     cache_ts = str(int(time.time() * 1000))
-    resp = requests.get(
-        url,
-        params=params or {},
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-            "cache-ts-v2": cache_ts,
-            "encryption": "true",
-            "language": "en",
-            "Origin": "https://www.coinglass.com",
-            "Referer": "https://www.coinglass.com",
-            "Sec-Ch-Ua": '"Google Chrome";v="125", "Chromium";v="125"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Linux"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0.0.0 Safari/537.36",
-        },
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-
-    user = resp.headers.get("user")
-    v = resp.headers.get("v")
-    if not user or not v:
-        # Plain (non-encrypted) endpoint — return JSON directly
-        return resp.json()
-
-    return decrypt(
-        resp.text,
-        user,
-        v,
-        url,
-        cache_ts=cache_ts,
-        time_header=resp.headers.get("time", ""),
-    )
+    try:
+        resp = requests.get(url, params=params or {}, timeout=timeout, headers={
+            'Accept': 'application/json', 'cache-ts-v2': cache_ts,
+            'encryption': 'true', 'language': 'en',
+            'Origin': 'https://www.coinglass.com',
+            'Referer': 'https://www.coinglass.com/',
+            'User-Agent': 'Mozilla/5.0',
+        })
+        resp.raise_for_status()
+    except requests.RequestException:
+        raise CoinGlassError('transport', 'http_failure', 'HTTP request failed') from None
+    headers = {k.lower(): v for k, v in resp.headers.items()}
+    user, version = headers.get('user'), headers.get('v')
+    if ('user' in headers) != ('v' in headers) or (('user' in headers) and (not user or version in (None, ''))):
+        raise CoinGlassError('decrypt', 'missing_header', 'Incomplete encryption headers')
+    if user is not None and version is not None:
+        return decrypt(resp.text, user, version, url, cache_ts=cache_ts,
+                       time_header=headers.get('time', ''))
+    try:
+        value = check_business(resp.json())
+    except CoinGlassError:
+        raise
+    except Exception:
+        raise CoinGlassError('schema', 'invalid_json', 'Invalid JSON response') from None
+    if not isinstance(value, (dict, list)):
+        raise CoinGlassError('schema', 'invalid_payload', 'Expected object or array')
+    if isinstance(value, dict) and (isinstance(value.get('data'), str) or value.get('encryption') in (True, 'true')):
+        raise CoinGlassError('decrypt', 'missing_headers', 'Encrypted payload without headers')
+    return value
