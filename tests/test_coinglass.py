@@ -131,6 +131,25 @@ class ClientTests(unittest.TestCase):
                 cg.coinglass_heatmap()
             self.assertEqual(caught.exception.code, 'ambiguous_or_unknown')
 
+    def test_delivery_named_conventional_symbol_never_shadows_perpetual(self):
+        """A conventional name bound to a dated delivery must not hide a real perp."""
+        rows = [
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+             'originalSymbol': 'BTCUSDT', 'type': 5},
+            {'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+             'originalSymbol': 'BTCUSDT_PERP', 'type': 1},
+        ]
+        with patch.object(cg, 'cg_fetch', side_effect=[rows, fixture()]) as fetch:
+            cg.coinglass_heatmap()
+        self.assertEqual(fetch.call_args.args[1]['symbol'], 'Binance_BTCUSDT_PERP')
+        # Conventional delivery + multiple perps -> ambiguity, not a silent delivery pick.
+        rows.append({'symbol': 'BTC', 'exchangeName': 'Binance', 'quoteCurrency': 'USDT',
+                     'originalSymbol': 'BTCUSDT_PERP2', 'type': 1})
+        with patch.object(cg, 'cg_fetch', return_value=rows):
+            with self.assertRaises(dec.CoinGlassError) as caught:
+                cg.coinglass_heatmap()
+            self.assertEqual(caught.exception.code, 'ambiguous_or_unknown')
+
     def test_positional_and_explicit_legacy(self):
         with patch.object(cg, 'cg_fetch', return_value=fixture()) as fetch:
             cg.coinglass_heatmap('BTC', 'Binance', '15', 288, original_symbol='BTCUSDT')

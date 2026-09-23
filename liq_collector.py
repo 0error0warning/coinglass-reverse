@@ -173,7 +173,7 @@ def load_okx_instruments(symbols=DEFAULT_SYMBOLS):
     return {r['instId']:r for r in data['data'] if r['instId'].replace('-SWAP','').replace('-','') in symbols}
 
 
-def run_source(source, collector, stop_event, *, instruments=None, ws_factory=None, backoff=5, ack_timeout=15):
+def run_source(source, collector, stop_event, *, instruments=None, ws_factory=None, backoff=5, ack_timeout=15, ping_interval=20):
     if stop_event.is_set(): return
     if ws_factory is None:
         import websocket
@@ -187,8 +187,11 @@ def run_source(source, collector, stop_event, *, instruments=None, ws_factory=No
                     'okx':{'op':'subscribe','args':[{'channel':'liquidation-orders','instType':'SWAP'}]}}[source]
     attempt = 0
     while not stop_event.is_set():
+        # 'errors' stays a local attempt counter; do NOT upload it via
+        # update_source or each reconnect would reset the cumulative health
+        # counter and hide a flapping source.
         status = {'acknowledged':False, 'connected':False, 'errors':0}
-        collector.update_source(source, **status)
+        collector.update_source(source, acknowledged=False, connected=False)
         try:
             metadata = instruments if instruments is not None else (load_okx_instruments() if source == 'okx' else {})
             done = threading.Event()
@@ -238,8 +241,10 @@ def run_source(source, collector, stop_event, *, instruments=None, ws_factory=No
                     if stop_event.is_set(): ws.close(); return
                     if opened.is_set() and not status['acknowledged'] and time.monotonic()-opened_at[0] >= ack_timeout:
                         status['errors'] += 1; collector.increment_source_error(source); log.error('%s subscription ACK timeout', source); ws.close(); return
-                    if source == 'okx' and opened.is_set() and time.monotonic()-last_ping > 20:
-                        try: ws.send('ping')
+                    if source in ('bybit', 'okx') and opened.is_set() and time.monotonic()-last_ping > ping_interval:
+                        # Bybit V5 and OKX require an app-level heartbeat every ~20s;
+                        # a protocol ping alone is not honoured by either venue.
+                        try: ws.send('ping' if source == 'okx' else json.dumps({'op': 'ping'}))
                         except Exception as exc: on_error(ws, exc); ws.close(); return
                         last_ping = time.monotonic()
             watcher = threading.Thread(target=watch, daemon=True); watcher.start()

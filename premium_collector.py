@@ -10,6 +10,7 @@ import math
 import os
 import sqlite3
 import signal
+import tempfile
 import threading
 import time
 import urllib.request
@@ -40,6 +41,27 @@ def init_db():
         conn.execute('CREATE TABLE IF NOT EXISTS premium (sym TEXT, ts INTEGER, coinbase REAL, binance REAL, diff REAL, pct REAL, PRIMARY KEY(sym, ts))')
         prune(conn)
     return conn
+
+
+def write_health(statuses, *, now_ms=None):
+    """Atomic per-symbol collection health next to premium.db; never in the DB glob."""
+    health_dir = STATE_DIR / '_health'
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    health_dir.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile('w', dir=health_dir, prefix='.status', suffix='.tmp', delete=False) as f:
+            tmp = f.name
+            json.dump({'schema_version': 1, 'updated_ms': now,
+                       'symbols': {s['symbol']: {'status': s['status'],
+                                                **({'error_type': s['error_type']} if 'error_type' in s else {})}
+                                   for s in statuses}}, f, allow_nan=False)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, health_dir / 'status.json')
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.unlink(tmp)
+            except OSError: log.warning('cannot clean temporary health file %s', tmp)
 
 
 def collect_once(conn):
@@ -73,7 +95,10 @@ def main(stop_event=None):
     conn=init_db()
     try:
         while not stop_event.is_set():
-            try:collect_once(conn)
+            try:
+                statuses = collect_once(conn)
+                try: write_health(statuses)
+                except OSError as exc: log.error('health write failed: %s', exc)
             except Exception as exc:log.error('collection/retention failed (%s)',type(exc).__name__)
             if stop_event.wait(INTERVAL):break
     except KeyboardInterrupt:

@@ -58,6 +58,23 @@ def test_run_return_without_close_callback_marks_disconnected(tmp_path):
     lc.run_source('binance', collector, stop, ws_factory=Fake)
     assert not collector.health_snapshot()['sources']['binance']['connected']
 
+def test_premium_health_reports_per_symbol_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(pc, 'STATE_DIR', tmp_path)
+    pc.write_health([{'symbol': 'BTC', 'status': 'ok'},
+                     {'symbol': 'ETH', 'status': 'error', 'error_type': 'TimeoutError'}],
+                    now_ms=1700000000000)
+    data = json.loads((tmp_path / '_health' / 'status.json').read_text())
+    assert data['updated_ms'] == 1700000000000
+    assert data['symbols']['BTC'] == {'status': 'ok'}
+    assert data['symbols']['ETH'] == {'status': 'error', 'error_type': 'TimeoutError'}
+    # Failed replace preserves the previous snapshot like the liq collector.
+    before = (tmp_path / '_health' / 'status.json').read_bytes()
+    with patch.object(pc.os, 'replace', side_effect=OSError('fixture')):
+        with pytest.raises(OSError):
+            pc.write_health([], now_ms=1700000000001)
+    assert (tmp_path / '_health' / 'status.json').read_bytes() == before
+
+
 def test_premium_term_closes_database(monkeypatch):
     handlers={}; closed=[]
     monkeypatch.setattr(pc.signal,'signal',lambda sig,handler: handlers.update({sig:handler}))

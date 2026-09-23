@@ -255,3 +255,59 @@ def test_okx_instruments_uses_public_user_agent_and_parses_metadata():
     assert seen['headers']['User-agent'] == 'Mozilla/5.0'
     assert result['BTC-USDT-SWAP']['ctVal'] == '.01'
     assert 'DOGE-USDT-SWAP' not in result
+
+
+def test_reconnect_does_not_reset_cumulative_source_errors(tmp_path):
+    c = importlib.import_module('liq_collector')
+    stop = threading.Event()
+    attempts = []
+    class Fake:
+        def __init__(self, url, **callbacks): self.cb = callbacks; self.closed = threading.Event()
+        def send(self, msg): pass
+        def close(self): self.closed.set()
+        def run_forever(self, **kwargs):
+            self.cb['on_open'](self)
+            # Never ACK: watcher times out and closes us, ending this attempt.
+            attempts.append(1)
+            self.closed.wait(5)
+    collector = c.Collector(tmp_path)
+    thread = threading.Thread(target=c.run_source,
+        args=('bybit', collector, stop),
+        kwargs={'ws_factory': Fake, 'backoff': 0, 'ack_timeout': 0})
+    thread.start()
+    # Wait until two ACK timeouts have been recorded, then stop deterministically.
+    import time as _t
+    deadline = _t.time() + 10
+    while _t.time() < deadline:
+        with collector._lock:
+            if collector.status.get('bybit', {}).get('errors', 0) >= 2:
+                break
+        _t.sleep(0.05)
+    stop.set(); thread.join(timeout=10)
+    assert len(attempts) >= 2
+    assert collector.status['bybit']['errors'] >= 2
+
+
+def test_bybit_and_okx_send_app_level_ping(tmp_path):
+    c = importlib.import_module('liq_collector')
+    acks = {'bybit': '{"op":"subscribe","success":true}',
+            'okx': '{"event":"subscribe","arg":{"channel":"liquidation-orders","instType":"SWAP"}}'}
+    for source, ack in acks.items():
+        stop = threading.Event(); sent = []
+        class Fake:
+            def __init__(self, url, **callbacks): self.cb = callbacks
+            def send(self, msg): sent.append(msg)
+            def close(self): pass
+            def run_forever(self, **kwargs):
+                self.cb['on_open'](self)
+                self.cb['on_message'](self, ack)
+                # ping_interval=0 makes the watcher fire on its first tick.
+                import time as _t; _t.sleep(0.35)
+                stop.set()
+        collector = c.Collector(tmp_path)
+        c.run_source(source, collector, stop, instruments={} if source == 'okx' else None,
+                     ws_factory=Fake, backoff=0, ack_timeout=60, ping_interval=0)
+        if source == 'bybit':
+            assert any(json.loads(s).get('op') == 'ping' for s in sent if s.startswith('{')), sent
+        else:
+            assert 'ping' in sent, sent
