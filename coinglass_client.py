@@ -218,7 +218,10 @@ def _resolve_pair_ticker(matches, symbol, quote):
     Live CoinGlass ticker search returns perpetual + dated deliveries for the
     same exchange/base/quote (e.g. BTCUSDT plus BTCUSDT_260925). Prefer the
     conventional `{symbol}{quote}` originalSymbol (BTCUSDT) — the same ticker
-    the 6/6 live pair smoke used — then a unique type==1 perpetual. Zero hits
+    the 6/6 live pair smoke used — but ONLY when it is itself a perpetual
+    (type==1) or when no type==1 instrument exists to conflict with it. A
+    conventional name that is a dated delivery must not silently bind the
+    heatmap to a futures contract while a real perpetual exists. Zero hits
     or remaining ambiguity stay fail-closed.
     """
     if len(matches) == 1:
@@ -227,9 +230,9 @@ def _resolve_pair_ticker(matches, symbol, quote):
         raise CoinGlassError('instrument', 'ambiguous_or_unknown', 'Expected one matching instrument')
     conventional = f'{symbol}{quote}'
     exact = [r for r in matches if r.get('originalSymbol') == conventional]
-    if len(exact) == 1:
-        return exact[0]
     perps = [r for r in matches if r.get('type') == 1]
+    if len(exact) == 1 and (exact[0].get('type') == 1 or not perps):
+        return exact[0]
     if len(perps) == 1:
         return perps[0]
     raise CoinGlassError('instrument', 'ambiguous_or_unknown', 'Expected one matching instrument')

@@ -40,6 +40,10 @@ OKX swap `sz` is contracts; normalize through `ctVal/ctMult/ctValCcy` and the li
 
 Bybit `allLiquidation.*` has array data. Its `S` is position side (`Buy` means long liquidated), unlike an exchange's forced execution order side. A shared generic BUY→short rule is unsafe.
 
+`ls`/`lsr` from `long-short-ratio-history` are the venue-reported long/short **account percentages** and upstream ratio field — not position notional or a count of people. The sentiment row annotates them via `ls_unit`/`lsr_unit`.
+
+The Deribit `reference_price` (and its `spot` compatibility key) is the venue's `estimated_delivery_price` index estimate for the selected expiry, not a separately fetched live spot quote — `reference_price_kind` states this explicitly.
+
 Even additive observations are only the events covered by that upstream feed. Bucket units are base assets, not assumed USD; source prices remain venue-specific liquidation prices.
 
 ## Other compatibility changes

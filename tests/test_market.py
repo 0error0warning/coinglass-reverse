@@ -135,6 +135,32 @@ def test_spot_source_aggregate_statuses(modules):
     assert m._source(lambda:{'status':'legacy_untyped','error':'old'}, 'liq_map')['status']=='legacy_untyped'
 
 
+def test_sentiment_rows_annotate_ls_units_and_ratio(modules, monkeypatch):
+    m,_,_=modules
+    monkeypatch.setattr(m, 'find_perp', lambda *a, **k: {'A': 'BTCUSDT_PERP.A'})
+    replies = iter([
+        [{'history': [{'o': 1, 'c': 2}]}],            # open-interest-history
+        [{'history': [{'l': 3, 's': 4}]}],            # liquidation-history
+        [{'history': [{'t': 1, 'r': 1.6, 'l': 61.5, 's': 38.5}]}],  # long-short-ratio-history
+        [{'history': [{'c': 0.01}]}],                 # funding-rate-history
+    ])
+    monkeypatch.setattr(m, 'cy_get', lambda path: next(replies))
+    row = m.scan_sentiment('BTC')[0]
+    assert row['ls'] == (61.5, 38.5)
+    assert row['lsr'] == 1.6
+    assert row['ls_unit'] == 'percent_of_accounts'
+    assert row['lsr_unit'] == 'upstream_long_short_accounts_ratio'
+
+
+def test_deribit_reference_price_kind_is_estimated_delivery(modules, monkeypatch):
+    m,_,_=modules
+    response={'result':[{'instrument_name':'BTC-01JAN30-100000-C','open_interest':1,'estimated_delivery_price':100000}]}
+    monkeypatch.setattr(m,'get',lambda *a,**k:json.dumps(response).encode())
+    result = m.deribit_walls(expiry='01JAN30')
+    assert result['reference_price'] == 100000
+    assert result['reference_price_kind'] == 'deribit_estimated_delivery_price'
+
+
 def test_sentiment_source_aggregate_statuses(modules):
     m,_,_=modules
     good={'ex':'Binance','oi_chg':1,'long_liq':2,'short_liq':3,'ls':None,'fr':.01}

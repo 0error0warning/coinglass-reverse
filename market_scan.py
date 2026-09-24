@@ -103,8 +103,10 @@ def scan_sentiment(base='BTC', quote='USDT', hours=24):
                          'long_liq':sum(x['l'] for x in lq) if lq and all(x.get('l') is not None for x in lq) else None,
                          'short_liq':sum(x['s'] for x in lq) if lq and all(x.get('s') is not None for x in lq) else None,
                          'ls':(lsr[-1].get('l'),lsr[-1].get('s')) if lsr else None,
+                         'lsr':lsr[-1].get('r') if lsr else None,
                          'fr':fr[-1].get('c') if fr else None,
                          'liquidation_unit':'USD','oi_change_unit':'percent','funding_unit':'percent',
+                         'ls_unit':'percent_of_accounts','lsr_unit':'upstream_long_short_accounts_ratio',
                          'coverage':'selected stable-margined perpetuals; upstream history may be incomplete'})
         except Exception as exc:
             rows.append({'ex':EX_NAME.get(ex,ex),'status':'error','error_type':type(exc).__name__})
@@ -143,7 +145,9 @@ def deribit_walls(currency='BTC', expiry_policy='max_oi', expiry=None, now=None)
             strikes[strike]['call' if parts[3]=='C' else 'put']+=oi
             reference=item.get('estimated_delivery_price',reference)
     pain=min(strikes,key=lambda price:sum(max(0,price-s)*v['call']+max(0,s-price)*v['put'] for s,v in strikes.items()))
-    return {'spot':reference,'reference_price':reference,'expiry':selected,'expiry_policy':'explicit' if expiry else expiry_policy,
+    return {'spot':reference,'reference_price':reference,
+            'reference_price_kind':'deribit_estimated_delivery_price',
+            'expiry':selected,'expiry_policy':'explicit' if expiry else expiry_policy,
             'strikes':dict(strikes),'max_pain':pain,'total_oi':totals[selected],'unit':currency,
             'metric':'open_interest_distribution','max_pain_method':'simplified terminal intrinsic-value objective; not a forecast'}
 
