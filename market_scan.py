@@ -65,14 +65,44 @@ def cy_get(path):
 
 def find_perp(base, quote='USDT'):
     global _markets_cache
+    if not isinstance(base,str) or not isinstance(quote,str):
+        raise ValueError('base and quote assets must be strings')
+    base=base.upper()
+    quote=quote.upper()
+    if not re.fullmatch(r'[A-Z0-9]+',base) or not re.fullmatch(r'[A-Z0-9]+',quote):
+        raise ValueError('invalid base or quote asset')
     if _markets_cache is None:
         _markets_cache = cy_get('/v1/future-markets')
     if not isinstance(_markets_cache,list):
         raise ValueError('Coinalyze markets response is not a list')
-    want = base.upper()+quote
-    return {m['exchange']:m['symbol'] for m in _markets_cache
-            if m.get('symbol_on_exchange','').replace('-','')==want
-            and m.get('is_perpetual') and m.get('margined')=='STABLE'}
+    candidates=defaultdict(lambda:defaultdict(set))
+    for market in _markets_cache:
+        if not isinstance(market,dict):
+            continue
+        exchange=market.get('exchange')
+        symbol=market.get('symbol')
+        if not isinstance(exchange,str) or not exchange or not isinstance(symbol,str) or not symbol:
+            continue
+        if market.get('base_asset') != base or market.get('is_perpetual') is not True:
+            continue
+        if market.get('margined') != 'STABLE':
+            continue
+        market_quote=market.get('quote_asset')
+        if market_quote == quote:
+            priority=0
+        elif exchange == 'H' and quote == 'USDT' and market_quote == 'USD':
+            priority=1
+        else:
+            continue
+        candidates[exchange][priority].add(symbol)
+    selected={}
+    for exchange in sorted(candidates):
+        priority=min(candidates[exchange])
+        symbols=candidates[exchange][priority]
+        if len(symbols) != 1:
+            raise ValueError(f'ambiguous Coinalyze perpetual market for exchange {exchange}')
+        selected[exchange]=next(iter(symbols))
+    return selected
 
 
 def hist(symbol, endpoint, hours=24):
@@ -88,28 +118,133 @@ def hist(symbol, endpoint, hours=24):
     return d[0].get('history',[]) if d else []
 
 
+def _market_capability(exchange, symbol, field):
+    if not isinstance(_markets_cache,list):
+        return None
+    values=[]
+    for market in _markets_cache:
+        if not isinstance(market,dict):
+            continue
+        if market.get('exchange') == exchange and market.get('symbol') == symbol and field in market:
+            values.append(market[field])
+    if any(value is False for value in values):
+        return False
+    if any(value is True for value in values):
+        return True
+    return None
+
+
+def _number(value):
+    return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value)
+
+
+def _oi_change(history):
+    if len(history) < 2:
+        return None
+    if not isinstance(history[0],dict) or not isinstance(history[-1],dict):
+        raise ValueError('malformed open-interest history')
+    opening=history[0].get('o')
+    closing=history[-1].get('c')
+    if not _number(opening) or not _number(closing):
+        raise ValueError('malformed open-interest values')
+    if opening == 0:
+        return None
+    return (closing/opening-1)*100
+
+
+def _liquidations(history):
+    long_total=0
+    short_total=0
+    for item in history:
+        if not isinstance(item,dict) or not _number(item.get('l')) or not _number(item.get('s')):
+            raise ValueError('malformed liquidation history')
+        long_total += item['l']
+        short_total += item['s']
+    return long_total,short_total
+
+
+def _long_short(history):
+    item=history[-1]
+    if not isinstance(item,dict):
+        raise ValueError('malformed long-short history')
+    ratio=item.get('r')
+    long_share=item.get('l')
+    short_share=item.get('s')
+    if not all(_number(value) for value in (ratio,long_share,short_share)):
+        raise ValueError('malformed long-short values')
+    return (long_share,short_share),ratio
+
+
+def _funding(history):
+    item=history[-1]
+    if not isinstance(item,dict) or not _number(item.get('c')):
+        raise ValueError('malformed funding history')
+    return item['c']
+
+
 def scan_sentiment(base='BTC', quote='USDT', hours=24):
     rows=[]
     for ex,sym in find_perp(base,quote).items():
         if ex not in ('A','6','3','H'):
             continue
-        try:
-            oi=hist(sym,'open-interest-history',hours)
-            lq=hist(sym,'liquidation-history',hours)
-            lsr=hist(sym,'long-short-ratio-history',hours)
-            fr=hist(sym,'funding-rate-history',hours)
-            rows.append({'ex':EX_NAME.get(ex,ex),
-                         'oi_chg':(oi[-1]['c']/oi[0]['o']-1)*100 if len(oi)>=2 and oi[0].get('o') else None,
-                         'long_liq':sum(x['l'] for x in lq) if lq and all(x.get('l') is not None for x in lq) else None,
-                         'short_liq':sum(x['s'] for x in lq) if lq and all(x.get('s') is not None for x in lq) else None,
-                         'ls':(lsr[-1].get('l'),lsr[-1].get('s')) if lsr else None,
-                         'lsr':lsr[-1].get('r') if lsr else None,
-                         'fr':fr[-1].get('c') if fr else None,
-                         'liquidation_unit':'USD','oi_change_unit':'percent','funding_unit':'percent',
-                         'ls_unit':'percent_of_accounts','lsr_unit':'upstream_long_short_accounts_ratio',
-                         'coverage':'selected stable-margined perpetuals; upstream history may be incomplete'})
-        except Exception as exc:
-            rows.append({'ex':EX_NAME.get(ex,ex),'status':'error','error_type':type(exc).__name__})
+        row={'ex':EX_NAME.get(ex,ex),'oi_chg':None,'long_liq':None,'short_liq':None,
+             'ls':None,'lsr':None,'fr':None,
+             'liquidation_unit':'USD','oi_change_unit':'percent','funding_unit':'percent',
+             'ls_unit':'percent_of_accounts','lsr_unit':'upstream_long_short_accounts_ratio',
+             'coverage':'selected stable-margined perpetuals; upstream history may be incomplete'}
+        statuses={}
+        errors={}
+
+        indicators=(
+            ('open_interest','open-interest-history',_oi_change),
+            ('liquidation','liquidation-history',_liquidations),
+            ('long_short_ratio','long-short-ratio-history',_long_short),
+            ('funding','funding-rate-history',_funding),
+        )
+        values={}
+        for name,endpoint,parser in indicators:
+            if name == 'long_short_ratio' and _market_capability(ex,sym,'has_long_short_ratio_data') is False:
+                statuses[name]='unsupported'
+                continue
+            try:
+                history=hist(sym,endpoint,hours)
+                if not isinstance(history,list):
+                    raise ValueError('Coinalyze history is not a list')
+                if not history:
+                    statuses[name]='no_data'
+                    continue
+                value=parser(history)
+                if value is None:
+                    statuses[name]='no_data'
+                    continue
+                statuses[name]='ok'
+                values[name]=value
+            except Exception as exc:
+                statuses[name]='error'
+                errors[name]=type(exc).__name__
+
+        row['oi_chg']=values.get('open_interest')
+        if 'liquidation' in values:
+            row['long_liq'],row['short_liq']=values['liquidation']
+        if 'long_short_ratio' in values:
+            row['ls'],row['lsr']=values['long_short_ratio']
+        row['fr']=values.get('funding')
+        has_values=any(status == 'ok' for status in statuses.values())
+        has_errors=any(status == 'error' for status in statuses.values())
+        # Capability/window gaps are explicit in metadata, not transport failures.
+        if has_values and has_errors:
+            row['status']='partial'
+        elif has_values:
+            row['status']='ok'
+        elif has_errors:
+            row['status']='error'
+            row['error_type']=next(iter(errors.values()))
+        else:
+            row['status']='no_data'
+        row['metadata']={'matched_symbol':sym,'indicator_statuses':statuses}
+        if errors:
+            row['metadata']['indicator_errors']=errors
+        rows.append(row)
     return rows
 
 
@@ -365,16 +500,23 @@ def _sentiment_status(data):
     usable = 0
     errors = 0
     no_data = 0
+    partial = 0
     fields = ('oi_chg', 'long_liq', 'short_liq', 'ls', 'fr')
     for row in data:
         if isinstance(row, dict) and row.get('status') == 'error':
             errors += 1
         elif isinstance(row, dict) and row.get('status') == 'no_data':
             no_data += 1
+        elif isinstance(row, dict) and row.get('status') == 'partial':
+            partial += 1
+            if any(row.get(key) is not None for key in fields):
+                usable += 1
         elif isinstance(row, dict) and any(row.get(key) is not None for key in fields):
             usable += 1
         else:
             no_data += 1
+    if partial:
+        return 'partial'
     if usable and not errors and not no_data:
         return 'ok'
     if usable:
